@@ -10,7 +10,7 @@
 namespace graphics
 {
 
-VirtualKeyboard::VirtualKeyboard() : cursorRow(0), cursorCol(0), lastActivityTime(millis())
+VirtualKeyboard::VirtualKeyboard() : cursorRow(0), cursorCol(0), lastActivityTime(millis()), upperCaseLayer(false)
 {
     initializeKeyboard();
     // Set cursor to H(2, 5)
@@ -22,15 +22,26 @@ VirtualKeyboard::~VirtualKeyboard() {}
 
 void VirtualKeyboard::initializeKeyboard()
 {
-    // New 4 row, 11 column keyboard layout:
-    static const char LAYOUT[KEYBOARD_ROWS][KEYBOARD_COLS] = {{'1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '\b'},
-                                                              {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '\n'},
-                                                              {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', ' '},
-                                                              {'z', 'x', 'c', 'v', 'b', 'n', 'm', '.', ',', '?', '\x1b'}};
+    // Define two layouts: lowercase and uppercase/symbols
+    static const char LAYOUT_LOWER[KEYBOARD_ROWS][KEYBOARD_COLS] = {
+        {'1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '\b'},
+        {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '\n'},
+        {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '\xF1', ' '},
+        {'z', 'x', 'c', 'v', 'b', 'n', 'm', '.', ',', '\x01', '\x1b'}};
+
+    // Uppercase layout with WiFi-friendly symbols in top row
+    static const char LAYOUT_UPPER[KEYBOARD_ROWS][KEYBOARD_COLS] = {
+        {'!', '@', '?', '#', '%', '&', '*', '<', '>', '+', '\b'},
+        {'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '\n'},
+        {'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', '\xD1', ' '},
+        {'Z', 'X', 'C', 'V', 'B', 'N', 'M', '-', '_', '\x01', '\x1b'}};
+
+    // Choose current layout based on layer state
+    const char(*currentLayout)[KEYBOARD_COLS] = upperCaseLayer ? LAYOUT_UPPER : LAYOUT_LOWER;
 
     // Derive layout dimensions and assert they match the configured keyboard grid
-    constexpr int LAYOUT_ROWS = (int)(sizeof(LAYOUT) / sizeof(LAYOUT[0]));
-    constexpr int LAYOUT_COLS = (int)(sizeof(LAYOUT[0]) / sizeof(LAYOUT[0][0]));
+    constexpr int LAYOUT_ROWS = (int)(sizeof(LAYOUT_LOWER) / sizeof(LAYOUT_LOWER[0]));
+    constexpr int LAYOUT_COLS = (int)(sizeof(LAYOUT_LOWER[0]) / sizeof(LAYOUT_LOWER[0][0]));
     static_assert(LAYOUT_ROWS == KEYBOARD_ROWS, "LAYOUT rows must equal KEYBOARD_ROWS");
     static_assert(LAYOUT_COLS == KEYBOARD_COLS, "LAYOUT cols must equal KEYBOARD_COLS");
 
@@ -41,11 +52,10 @@ void VirtualKeyboard::initializeKeyboard()
         }
     }
 
-    // Fill keyboard from the 2D layout
+    // Fill keyboard from the current layout
     for (int row = 0; row < LAYOUT_ROWS; row++) {
         for (int col = 0; col < LAYOUT_COLS; col++) {
-            char ch = LAYOUT[row][col];
-            // No empty slots in the simplified layout
+            char ch = currentLayout[row][col];
 
             VirtualKeyType type = VK_CHAR;
             if (ch == '\b') {
@@ -56,10 +66,14 @@ void VirtualKeyboard::initializeKeyboard()
                 type = VK_ESC;
             } else if (ch == ' ') {
                 type = VK_SPACE;
+            } else if (ch == '\x01') { // SHIFT (using control character as marker)
+                type = VK_SHIFT;
             }
 
             // Make action keys wider to fit text while keeping the last column aligned
-            uint8_t width = (type == VK_BACKSPACE || type == VK_ENTER || type == VK_SPACE) ? (KEY_WIDTH * 3) : KEY_WIDTH;
+            uint8_t width =
+                (type == VK_BACKSPACE || type == VK_ENTER || type == VK_SPACE || type == VK_ESC) ? (KEY_WIDTH * 3) : KEY_WIDTH;
+
             keyboard[row][col] = {ch, type, (uint8_t)(col * KEY_WIDTH), (uint8_t)(row * KEY_HEIGHT), width, KEY_HEIGHT};
         }
     }
@@ -204,6 +218,11 @@ void VirtualKeyboard::drawInputArea(OLEDDisplay *display, int16_t offsetX, int16
             headerHeight = FONT_HEIGHT_SMALL; // no extra padding baked in
         }
     }
+
+    // Draw layer indicator in top right corner
+    std::string layerIndicator = upperCaseLayer ? "ABC" : "abc";
+    int indicatorWidth = display->getStringWidth(layerIndicator.c_str());
+    display->drawString(screenWidth - indicatorWidth - 2, offsetY, layerIndicator.c_str());
 
     const int boxX = offsetX;
     const int boxWidth = screenWidth;
@@ -417,22 +436,38 @@ void VirtualKeyboard::drawKey(OLEDDisplay *display, const VirtualKey &key, bool 
     const int fontH = FONT_HEIGHT_SMALL;
     // Build label and metrics first
     std::string keyText;
-    if (key.type == VK_BACKSPACE || key.type == VK_ENTER || key.type == VK_SPACE || key.type == VK_ESC) {
+    if (key.type == VK_BACKSPACE || key.type == VK_ENTER || key.type == VK_SPACE || key.type == VK_ESC || key.type == VK_SHIFT) {
         // Keep literal text labels for the action keys on the rightmost column
         keyText = (key.type == VK_BACKSPACE) ? "BACK"
                   : (key.type == VK_ENTER)   ? "ENTER"
                   : (key.type == VK_SPACE)   ? "SPACE"
+                  : (key.type == VK_SHIFT)   ? "SH"
                   : (key.type == VK_ESC)     ? "ESC"
                                              : "";
     } else {
         char c = getCharForKey(key, false);
-        if (c >= 'a' && c <= 'z') {
-            c = c - 'a' + 'A';
+        if (key.character == ' ' || key.character == '_') {
+            keyText = "_";
+        } else if ((unsigned char)c == 0xF1) { // ñ in ASCII extended
+            keyText = "ñ";
+        } else if ((unsigned char)c == 0xD1) { // Ñ in ASCII extended
+            keyText = "Ñ";
+        } else {
+            keyText = std::string(1, c);
         }
-        keyText = (key.character == ' ' || key.character == '_') ? "_" : std::string(1, c);
     }
 
     int textWidth = display->getStringWidth(keyText.c_str());
+
+    // Special adjustment for Ñ characters that may have width calculation issues
+    if (keyText == "ñ" || keyText == "Ñ") {
+        // Use the width of 'n' or 'N' as reference for better centering
+        int refWidth = display->getStringWidth(keyText == "ñ" ? "n" : "N");
+        if (refWidth > 0) {
+            textWidth = refWidth;
+        }
+    }
+
     // Label alignment
     // - Rightmost action column: right-align text with a small right padding (~2px) so it hugs screen edge neatly.
     // - Other keys: center horizontally; use ceil-style rounding to avoid appearing left-biased on odd widths.
@@ -448,12 +483,18 @@ void VirtualKeyboard::drawKey(OLEDDisplay *display, const VirtualKey &key, bool 
         } else {
             textX = x + (width - textWidth) / 2;
         }
+
+        // Extra centering adjustment for Ñ characters
+        if (keyText == "ñ" || keyText == "Ñ") {
+            textX -= 1; // Shift slightly left for better visual centering
+        }
     }
     int contentTop = y;
     int contentH = height;
     if (selected) {
         display->setColor(WHITE);
-        bool isAction = (key.type == VK_BACKSPACE || key.type == VK_ENTER || key.type == VK_SPACE || key.type == VK_ESC);
+        bool isAction = (key.type == VK_BACKSPACE || key.type == VK_ENTER || key.type == VK_SPACE || key.type == VK_ESC ||
+                         key.type == VK_SHIFT);
 
         if (display->getHeight() <= 64 && !isAction) {
             display->fillRect(x, y, width, height);
@@ -611,14 +652,20 @@ void VirtualKeyboard::handlePress()
     case VK_SPACE:
         insertCharacter(' ');
         break;
+    case VK_SHIFT:
+        toggleLayer();
+        break;
     case VK_ESC:
+        // ESC should close the keyboard immediately and then call callback
+        if (screen) {
+            screen->setFrames(graphics::Screen::FOCUS_PRESERVE);
+        }
         if (onTextEntered) {
             std::function<void(const std::string &)> callback = onTextEntered;
-            onTextEntered = nullptr;
-            inputText = "";
-            callback("");
+            onTextEntered = nullptr; // Clear callback to close keyboard
+            callback("");            // Call with empty string for cancellation
         }
-        return;
+        break;
     default:
         break;
     }
@@ -656,9 +703,18 @@ void VirtualKeyboard::handleLongPress()
     case VK_SPACE:
         insertCharacter(' ');
         break;
+    case VK_SHIFT:
+        toggleLayer();
+        break;
     case VK_ESC:
+        // ESC should close the keyboard immediately and then call callback
+        if (screen) {
+            screen->setFrames(graphics::Screen::FOCUS_PRESERVE);
+        }
         if (onTextEntered) {
-            onTextEntered("");
+            std::function<void(const std::string &)> callback = onTextEntered;
+            onTextEntered = nullptr; // Clear callback to close keyboard
+            callback("");            // Call with empty string for cancellation
         }
         break;
     default:
@@ -669,13 +725,35 @@ void VirtualKeyboard::handleLongPress()
 void VirtualKeyboard::insertCharacter(char c)
 {
     if (inputText.length() < 160) { // Reasonable text length limit
-        inputText += c;
+        // Convert ASCII extended characters to UTF-8
+        if ((unsigned char)c == 0xF1) { // ñ in ASCII extended
+            inputText += "ñ";
+        } else if ((unsigned char)c == 0xD1) { // Ñ in ASCII extended
+            inputText += "Ñ";
+        } else {
+            inputText += c;
+        }
     }
 }
 
 void VirtualKeyboard::deleteCharacter()
 {
     if (!inputText.empty()) {
+        // Handle UTF-8 multi-byte characters correctly
+        size_t len = inputText.length();
+        if (len >= 2) {
+            // Check if the last two bytes form our special Ñ characters
+            unsigned char byte1 = (unsigned char)inputText[len - 2];
+            unsigned char byte2 = (unsigned char)inputText[len - 1];
+
+            // UTF-8 encoding for ñ is 0xC3 0xB1, for Ñ is 0xC3 0x91
+            if (byte1 == 0xC3 && (byte2 == 0xB1 || byte2 == 0x91)) {
+                // Remove both bytes of the UTF-8 character
+                inputText.erase(len - 2, 2);
+                return;
+            }
+        }
+        // For regular single-byte characters
         inputText.pop_back();
     }
 }
@@ -733,6 +811,13 @@ void VirtualKeyboard::resetTimeout()
 bool VirtualKeyboard::isTimedOut() const
 {
     return (millis() - lastActivityTime) > TIMEOUT_MS;
+}
+
+void VirtualKeyboard::toggleLayer()
+{
+    resetTimeout();
+    upperCaseLayer = !upperCaseLayer;
+    initializeKeyboard(); // Rebuild keyboard with new layer
 }
 
 } // namespace graphics

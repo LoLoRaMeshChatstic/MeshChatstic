@@ -4,8 +4,8 @@
 #include "graphics/draw/UIRenderer.h"
 #include "main.h"
 #include "meshtastic/config.pb.h"
-#include "power.h"
 #include "modules/ChatHistoryStore.h"
+#include "power.h"
 #include <OLEDDisplay.h>
 #include <graphics/images.h>
 
@@ -29,15 +29,48 @@ void determineResolution(int16_t screenheight, int16_t screenwidth)
 }
 
 // === Shared External State ===
-bool hasUnreadMessage = false;
+bool hasUnreadMessage = false; // Legacy - kept for compatibility
 bool isMuted = false;
 bool isHighResolution = false;
 
 // === Internal State ===
 bool isBoltVisibleShared = true;
 uint32_t lastBlinkShared = 0;
-bool isMailIconVisible = true;
-uint32_t lastMailBlink = 0;
+// Mail icon variables no longer needed since we use numeric counters
+// bool isMailIconVisible = true;
+// uint32_t lastMailBlink = 0;
+
+// *********************************
+// * Helper function for unread count display *
+// *********************************
+int drawUnreadCountOrMuteIcon(OLEDDisplay *display, int unreadCount, bool isMuted, int rightEdgeX, int textY, bool isInverted,
+                              bool force_no_invert)
+{
+    int iconRightEdge = rightEdgeX;
+
+    if (unreadCount > 0) {
+        // Mostrar contador de mensajes no leídos
+        char countStr[16];
+        snprintf(countStr, sizeof(countStr), "(%d)", unreadCount);
+
+        display->setFont(ArialMT_Plain_10);
+        int countWidth = display->getStringWidth(countStr);
+        int countX = iconRightEdge - countWidth;
+        int countY = textY;
+
+        if (isInverted && !force_no_invert) {
+            display->setColor(BLACK);
+        } else {
+            display->setColor(WHITE);
+        }
+        display->drawString(countX, countY, countStr);
+
+        // Actualizar iconRightEdge para siguientes elementos
+        iconRightEdge = countX - 2;
+    }
+
+    return iconRightEdge;
+}
 
 // *********************************
 // * Rounded Header when inverted *
@@ -59,7 +92,8 @@ void drawRoundedHighlight(OLEDDisplay *display, int16_t x, int16_t y, int16_t w,
 // *************************
 // * Common Header Drawing *
 // *************************
-void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *titleStr, bool force_no_invert, bool show_date)
+void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *titleStr, bool force_no_invert, bool show_date,
+                      bool hideUnreadCounter)
 {
     constexpr int HEADER_OFFSET_Y = 1;
     y += HEADER_OFFSET_Y;
@@ -205,10 +239,13 @@ void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *ti
         UIRenderer::formatDateTime(datetimeStr, sizeof(datetimeStr), rtc_sec, display, false);
         char dateLine[40];
 
+        // Obtener cuenta de mensajes no leídos (usada tanto para formato de fecha como para contador)
+        int unreadCount = hideUnreadCounter ? 0 : chat::ChatHistoryStore::instance().getTotalUnreadCount();
+
         if (isHighResolution) {
             snprintf(dateLine, sizeof(dateLine), "%s", datetimeStr);
         } else {
-            if (hasUnreadMessage) {
+            if (unreadCount > 0) {
                 snprintf(dateLine, sizeof(dateLine), "%s", &datetimeStr[5]);
             } else {
                 snprintf(dateLine, sizeof(dateLine), "%s", &datetimeStr[2]);
@@ -232,30 +269,10 @@ void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *ti
 
         // === Show Unread Messages Count or Mute Icon to the Left of Time ===
         int iconRightEdge = timeX - 2;
+        iconRightEdge =
+            drawUnreadCountOrMuteIcon(display, unreadCount, isMuted, iconRightEdge, textY, isInverted, force_no_invert);
 
-        // Get unread message count
-        int unreadCount = chat::ChatHistoryStore::instance().getTotalUnreadCount();
-
-        if (unreadCount > 0) {
-            // Show unread message counter
-            char countStr[16];
-            snprintf(countStr, sizeof(countStr), "(%d)", unreadCount);
-
-            display->setFont(ArialMT_Plain_10);
-            int countWidth = display->getStringWidth(countStr);
-            int countX = iconRightEdge - countWidth;
-            int countY = textY;
-
-            if (isInverted && !force_no_invert) {
-                display->setColor(BLACK);
-            } else {
-                display->setColor(WHITE);
-            }
-            display->drawString(countX, countY, countStr);
-
-            // Update iconRightEdge for next elements
-            iconRightEdge = countX - 2;
-        } else if (isMuted) {
+        if (!unreadCount && isMuted) {
             if (isHighResolution) {
                 int iconX = iconRightEdge - mute_symbol_big_width;
                 int iconY = textY + (FONT_HEIGHT_SMALL - mute_symbol_big_height) / 2;
@@ -300,39 +317,13 @@ void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *ti
         }
 
     } else {
-        // === No Time Available: Mail/Mute Icon Moves to Far Right ===
+        // === No Time Available: Unread Messages Count or Mute Icon Moves to Far Right ===
         int iconRightEdge = screenW - xOffset;
+        int unreadCount = hideUnreadCounter ? 0 : chat::ChatHistoryStore::instance().getTotalUnreadCount();
+        iconRightEdge =
+            drawUnreadCountOrMuteIcon(display, unreadCount, isMuted, iconRightEdge, textY, isInverted, force_no_invert);
 
-        bool showMail = false;
-
-#ifndef USE_EINK
-        if (hasUnreadMessage) {
-            if (now - lastMailBlink > 500) {
-                isMailIconVisible = !isMailIconVisible;
-                lastMailBlink = now;
-            }
-            showMail = isMailIconVisible;
-        }
-#else
-        if (hasUnreadMessage) {
-            showMail = true;
-        }
-#endif
-
-        if (showMail) {
-            if (useHorizontalBattery) {
-                int iconW = 16, iconH = 12;
-                int iconX = iconRightEdge - iconW;
-                int iconY = textY + (FONT_HEIGHT_SMALL - iconH) / 2 - 1;
-                display->drawRect(iconX, iconY, iconW + 1, iconH);
-                display->drawLine(iconX, iconY, iconX + iconW / 2, iconY + iconH - 4);
-                display->drawLine(iconX + iconW, iconY, iconX + iconW / 2, iconY + iconH - 4);
-            } else {
-                int iconX = iconRightEdge - mail_width;
-                int iconY = textY + (FONT_HEIGHT_SMALL - mail_height) / 2;
-                display->drawXbm(iconX, iconY, mail_width, mail_height, mail);
-            }
-        } else if (isMuted) {
+        if (!unreadCount && isMuted) {
             if (isHighResolution) {
                 int iconX = iconRightEdge - mute_symbol_big_width;
                 int iconY = textY + (FONT_HEIGHT_SMALL - mute_symbol_big_height) / 2;

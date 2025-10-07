@@ -43,6 +43,9 @@ class VirtualKeyboard
     void resetTimeout();
     bool isTimedOut() const;
 
+    // Layer management
+    void toggleLayer();
+
   private:
     static const uint8_t KEYBOARD_ROWS = 4;
     static const uint8_t KEYBOARD_COLS = 11;
@@ -61,6 +64,9 @@ class VirtualKeyboard
 
     // Timeout management for auto-exit
     uint32_t lastActivityTime;
+    // Layer management for uppercase/symbols
+    bool upperCaseLayer;
+
     static const uint32_t TIMEOUT_MS = 60000; // 1 minute timeout
 
     void initializeKeyboard();
@@ -72,9 +78,9 @@ class VirtualKeyboard
     void moveCursorDelta(int dRow, int dCol);
 
     char getCharForKey(const VirtualKey &key, bool isLongPress = false);
-    void insertCharacter(char c); // Insert character into input
-    void deleteCharacter();       // Delete character from input
-    void submitText();            // Submit text input
+    void insertCharacter(char c);
+    void deleteCharacter();
+    void submitText();
 };
 
 } // namespace graphics

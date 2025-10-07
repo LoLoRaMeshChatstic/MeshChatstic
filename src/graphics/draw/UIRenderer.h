@@ -32,10 +32,10 @@ class Screen;
 class UIRenderer
 {
   public:
-    //screen node info direct draw (no overlay, no focus handling)
+    // screen node info direct draw (no overlay, no focus handling)
     static void drawNodeInfoDirect(OLEDDisplay *display, const OLEDDisplayUiState *state, int16_t x, int16_t y);
 #if HAS_WIFI && !defined(ARCH_PORTDUINO)
-    //screen mqtt info direct draw (no overlay, no focus handling)
+    // screen mqtt info direct draw (no overlay, no focus handling)
     static void drawMqttInfoDirect(OLEDDisplay *display, const OLEDDisplayUiState *state, int16_t x, int16_t y);
 #endif
     // Common UI elements
@@ -96,6 +96,12 @@ class UIRenderer
     static bool shouldDrawMessage(const meshtastic_MeshPacket *packet);
     // Check if the display can render a string (detect special chars; emoji)
     static bool haveGlyphs(const char *str);
+
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    // WiFi status screen
+    static void drawWifiInfoDirect(OLEDDisplay *display, const OLEDDisplayUiState *state, int16_t x, int16_t y);
+    static bool showingWifiStatus;
+#endif
 }; // namespace UIRenderer
 
 } // namespace graphics
