@@ -43,31 +43,8 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
                                         &wasUpgraded); // Updates history; returns false when an upgrade is detected
 
     // Handle hop_limit upgrade scenario for rebroadcasters
-    // isRebroadcaster() is duplicated in perhapsRelay(), but this avoids confusing log messages
-    if (wasUpgraded && isRebroadcaster() && iface && p->hop_limit > 0) {
-        // Upgrade detection bypasses the duplicate short-circuit so we replace the queued packet before exiting
-        uint8_t dropThreshold = p->hop_limit; // remove queued packets that have fewer hops remaining
-        if (iface->removePendingTXPacket(getFrom(p), p->id, dropThreshold)) {
-            LOG_DEBUG("Processing upgraded packet 0x%08x for relay with hop limit %d (dropping queued < %d)", p->id, p->hop_limit,
-                      dropThreshold);
-
-            if (nodeDB)
-                nodeDB->updateFrom(*p);
-#if !MESHTASTIC_EXCLUDE_TRACEROUTE
-            if (traceRouteModule && p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-                p->decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP)
-                traceRouteModule->processUpgradedPacket(*p);
-#endif
-
-            perhapsRelay(p);
-
-            // We already enqueued the improved copy, so make sure the incoming packet stops here.
-            return true;
-        }
-
-        // No queue entry was replaced by this upgraded copy, so treat it as a duplicate to avoid
-        // delivering the same packet to applications/phone twice with different hop limits.
-        seenRecently = true;
+    if (wasUpgraded && perhapsHandleUpgradedPacket(p)) {
+        return true; // we handled it, so stop processing
     }
 
     if (seenRecently) {
@@ -119,8 +96,8 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
         if (p->from != 0) {
             meshtastic_NodeInfoLite *origTx = nodeDB->getMeshNode(p->from);
             if (origTx) {
-                // Either relayer of ACK was also a relayer of the packet, or we were the *only* relayer and the ACK came directly
-                // from the destination
+                // Either relayer of ACK was also a relayer of the packet, or we were the *only* relayer and the ACK came
+                // directly from the destination
                 bool wasAlreadyRelayer = wasRelayer(p->relay_node, p->decoded.request_id, p->to);
                 bool weWereSoleRelayer = false;
                 bool weWereRelayer = wasRelayer(ourRelayID, p->decoded.request_id, p->to, &weWereSoleRelayer);
@@ -157,14 +134,19 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
                     LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
 
-                // Use shared logic to determine if hop_limit should be decremented
-                if (shouldDecrementHopLimit(p)) {
-                    tosend->hop_limit--; // bump down the hop count
-                } else {
-                    LOG_INFO("Router/CLIENT_BASE-to-favorite-router/CLIENT_BASE relay: preserving hop_limit");
-                }
-
-                NextHopRouter::send(tosend);
+                    // Use shared logic to determine if hop_limit should be decremented
+                    if (shouldDecrementHopLimit(p)) {
+                        tosend->hop_limit--; // bump down the hop count
+                    } else {
+                        LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE rebroadcast: preserving hop_limit");
+                    }
+#if USERPREFS_EVENT_MODE
+                    if (tosend->hop_limit > 2) {
+                        // if we are "correcting" the hop_limit, "correct" the hop_start by the same amount to preserve hops away.
+                        tosend->hop_start -= (tosend->hop_limit - 2);
+                        tosend->hop_limit = 2;
+                    }
+#endif
 
                     if (p->next_hop == NO_NEXT_HOP_PREFERENCE) {
                         FloodingRouter::send(tosend);

@@ -1312,19 +1312,6 @@ void Screen::setup()
     MeshModule::observeUIEvents(&uiFrameEventObserver);
 }
 
-void Screen::setOn(bool on, FrameCallback einkScreensaver)
-{
-#if defined(T_LORA_PAGER)
-    if (cardKbI2cImpl)
-        cardKbI2cImpl->toggleBacklight(on);
-#endif
-    if (!on)
-        // We handle off commands immediately, because they might be called because the CPU is shutting down
-        handleSetOn(false, einkScreensaver);
-    else
-        enqueueCmd(ScreenCmd{.cmd = Cmd::SET_ON});
-}
-
 void Screen::forceDisplay(bool forceUiUpdate)
 {
     // Nasty hack to force epaper updates for 'key' frames.  FIXME, cleanup.
@@ -2121,54 +2108,26 @@ int Screen::handleTextMessage(const meshtastic_MeshPacket *packet)
 
             setFrames(FOCUS_PRESERVE); // Stay on same frame, silently update frame list
         } else {
-            // Incoming message
-            devicestate.has_rx_text_message = true; // Needed to include the message frame
-            hasUnreadMessage = true;                // Enables mail icon in the header
-            setFrames(FOCUS_PRESERVE);              // Refresh frame list without switching view
-
-            // Only wake/force display if the configuration allows it
-            if (shouldWakeOnReceivedMessage()) {
-                setOn(true);    // Wake up the screen first
-                forceDisplay(); // Forces screen redraw
-            }
-            // === Prepare banner content ===
-            const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(packet->from);
-            const meshtastic_Channel channel =
-                channels.getByIndex(packet->channel ? packet->channel : channels.getPrimaryIndex());
-            const char *longName = (node && node->has_user) ? node->user.long_name : nullptr;
-
-            const char *msgRaw = reinterpret_cast<const char *>(packet->decoded.payload.bytes);
-
-            char banner[256];
-
-            bool isAlert = false;
-
-            if (moduleConfig.external_notification.alert_bell || moduleConfig.external_notification.alert_bell_vibra ||
-                moduleConfig.external_notification.alert_bell_buzzer)
-                // Check for bell character to determine if this message is an alert
-                for (size_t i = 0; i < packet->decoded.payload.size && i < 100; i++) {
-                    if (msgRaw[i] == ASCII_BELL) {
-                        isAlert = true;
-                        break;
+            // === FAVORITES: only in DM (destination = my NodeNum) ===
+            // If the message is direct, mark the sender as favorite for quick access in chat tabs
+            const bool isDirect = (nodeDB && packet->to == nodeDB->getNodeNum());
+            if (isDirect) {
+                const uint32_t fromId = packet->from;
+                if (nodeDB && fromId != nodeDB->getNodeNum()) {
+                    const meshtastic_NodeInfoLite *cn = nodeDB->getMeshNode(fromId);
+                    bool isFav = (cn && cn->is_favorite);
+                    if (!isFav) {
+                        nodeDB->set_favorite(fromId, true);
+                        if (cn) {
+                            const_cast<meshtastic_NodeInfoLite *>(cn)->is_favorite = true;
+                        }
                     }
                 }
-
-            // Unlike generic messages, alerts (when enabled via the ext notif module) ignore any
-            // 'mute' preferences set to any specific node or channel.
-            if (isAlert) {
-                if (longName && longName[0]) {
-                    snprintf(banner, sizeof(banner), "Alert Received from\n%s", longName);
-                } else {
-                    strcpy(banner, "Alert Received");
-                }
-                screen->showSimpleBanner(banner, 3000);
-            } else if (!channel.settings.mute) {
-                if (longName && longName[0]) {
-#if defined(M5STACK_UNITC6L)
-                    strcpy(banner, "New Message");
-#else
-                    snprintf(banner, sizeof(banner), "New Message from\n%s", longName);
-#endif
+            } else {
+                // Channel message: optionally mark the channel as internal favorite
+                uint8_t ch = (uint8_t)packet->channel;
+                g_favChannelTabs.insert(ch);
+            }
 
             // Get channel for mute checking (upstream feature)
             const meshtastic_Channel channel =
@@ -2218,12 +2177,97 @@ int Screen::handleTextMessage(const meshtastic_MeshPacket *packet)
                         jumpTo = (uint8_t)(g_chanTabFirst + (itc - g_chanTabs.begin()));
                     }
                 }
+            }
+
+            // === RESET SCROLL AND UPDATE CURRENT CHAT ===
+            // Always update display if we're currently viewing the chat that received the message
+            // BUT maintain the position at the last read message (don't auto-scroll to newest)
+            uint8_t currentFrame = ui->getUiState()->currentFrame;
+            bool shouldForceRedraw = false;
+
+            if (isDirect) {
+                // Check if we're currently viewing this DM
+                if (g_favChatFirst != (size_t)-1 && currentFrame >= g_favChatFirst && currentFrame <= g_favChatLast) {
+                    auto it = std::find(g_favChatNodes.begin(), g_favChatNodes.end(), packet->from);
+                    if (it != g_favChatNodes.end()) {
+                        uint8_t expectedFrame = (uint8_t)(g_favChatFirst + (it - g_favChatNodes.begin()));
+                        if (currentFrame == expectedFrame) {
+                            // We're viewing this DM - force redraw to show new message
+                            // but DON'T change scroll position (keep at last read message)
+                            shouldForceRedraw = true;
+                        }
+                    }
+                }
+            } else {
+                // Mensaje de canal - check if we're currently viewing this channel
+                uint8_t ch = (uint8_t)packet->channel;
+                if (g_chanTabFirst != (size_t)-1 && currentFrame >= g_chanTabFirst && currentFrame <= g_chanTabLast) {
+                    auto itc = std::find(g_chanTabs.begin(), g_chanTabs.end(), ch);
+                    if (itc != g_chanTabs.end()) {
+                        uint8_t expectedFrame = (uint8_t)(g_chanTabFirst + (itc - g_chanTabs.begin()));
+                        if (currentFrame == expectedFrame) {
+                            // We're viewing this channel - force redraw to show new message
+                            // but DON'T change scroll position (keep at last read message)
+                            shouldForceRedraw = true;
+                        }
+                    }
+                }
+            }
+
+            // === SHOW NEW MESSAGE BANNER INSTEAD OF AUTO-JUMP ===
+            showNewMessageBanner(packet);
+
+            // === UPDATE MESSAGE CAROUSEL IF ACTIVE AND RELEVANT ===
+            // Only update carousel if it's showing the conversation that received the message
+            if (cannedMessageModule) {
+                // Check if carousel is active and showing the relevant conversation
+                bool shouldUpdateCarousel = false;
+
+                if (isDirect) {
+                    // DM message - check if carousel is showing this DM
+                    shouldUpdateCarousel = shouldForceRedraw; // Same logic as main chat view
+                } else {
+                    // Channel message - check if carousel is showing this channel
+                    shouldUpdateCarousel = shouldForceRedraw; // Same logic as main chat view
+                }
+
+                if (shouldUpdateCarousel) {
+                    cannedMessageModule->refreshCarouselIfActive();
+                }
+            }
+
+            // Force redraw if we're viewing the chat that received the message
+            if (shouldForceRedraw) {
+                setFastFramerate();
+                forceDisplay(true); // Forzar actualización UI sin cambiar scroll
+            }
+
+            // === BANNER DISPLAY (combining both approaches) ===
+            // Unlike generic messages, alerts (when enabled via the ext notif module) ignore any
+            // 'mute' preferences set to any specific node or channel.
+            if (isAlert) {
+                if (longName && longName[0]) {
+                    snprintf(banner, sizeof(banner), "Alert Received from\n%s", longName);
+                } else {
+                    strcpy(banner, "Alert Received");
+                }
+                screen->showSimpleBanner(banner, 3000);
+            } else if (!channel.settings.mute) {
+                if (longName && longName[0]) {
+#if defined(M5STACK_UNITC6L)
+                    strcpy(banner, "New Message");
+#else
+                    snprintf(banner, sizeof(banner), "New Message from\n%s", longName);
+#endif
+                } else {
+                    strcpy(banner, "New Message");
+                }
 #if defined(M5STACK_UNITC6L)
                 screen->setOn(true);
                 screen->showSimpleBanner(banner, 1500);
                 if (config.device.buzzer_mode != meshtastic_Config_DeviceConfig_BuzzerMode_DIRECT_MSG_ONLY ||
                     (isAlert && moduleConfig.external_notification.alert_bell_buzzer) ||
-                    (!isBroadcast(packet->to) && isToUs(p))) {
+                    (!isBroadcast(packet->to) && isToUs(packet))) {
                     // Beep if not in DIRECT_MSG_ONLY mode or if in DIRECT_MSG_ONLY mode and either
                     // - packet contains an alert and alert bell buzzer is enabled
                     // - packet is a non-broadcast that is addressed to this node

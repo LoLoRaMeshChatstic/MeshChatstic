@@ -76,12 +76,20 @@ static String s_wifiPendingSSID;
 
 void menuHandler::loraMenu()
 {
-    static const char *optionsArray[] = {"Back", "Device Role", "Radio Preset", "LoRa Region"};
-    enum optionsNumbers { Back = 0, device_role_picker = 1, radio_preset_picker = 2, lora_picker = 3 };
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    static const char *optionsArray[] = {"Back", "Device Role", "Radio Preset", "LoRa Region", "WiFi Config", "MQTT Config"};
+    enum optionsNumbers {
+        Back = 0,
+        device_role_picker = 1,
+        radio_preset_picker = 2,
+        lora_picker = 3,
+        wifi_config_menu = 4,
+        mqtt_base_menu = 5
+    };
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "LoRa Actions";
     bannerOptions.optionsArrayPtr = optionsArray;
-    bannerOptions.optionsCount = 4;
+    bannerOptions.optionsCount = 6;
     bannerOptions.bannerCallback = [](int selected) -> void {
         if (selected == Back) {
             // No action
@@ -91,6 +99,35 @@ void menuHandler::loraMenu()
             menuHandler::menuQueue = menuHandler::radio_preset_picker;
         } else if (selected == lora_picker) {
             menuHandler::menuQueue = menuHandler::lora_picker;
+        }
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+        else if (selected == wifi_config_menu) {
+            // Close this banner and launch the WiFi menu in the loop
+            NotificationRenderer::pauseBanner = true;
+            NotificationRenderer::alertBannerUntil = 1;
+            NotificationRenderer::optionsArrayPtr = nullptr;
+            NotificationRenderer::optionsEnumPtr = nullptr;
+            menuHandler::menuQueue = menuHandler::wifi_base_menu;
+        } else if (selected == mqtt_base_menu) {
+            menuHandler::menuQueue = menuHandler::mqtt_base_menu;
+        }
+#endif
+    };
+    screen->showOverlayBanner(bannerOptions);
+#else
+    static const char *optionsArray[] = {"Back", "Region Picker", "Device Role"};
+    enum optionsNumbers { Back = 0, lora_picker = 1, device_role_picker = 2 };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "LoRa Actions";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Back) {
+            // No action
+        } else if (selected == lora_picker) {
+            menuHandler::menuQueue = menuHandler::lora_picker;
+        } else if (selected == device_role_picker) {
+            menuHandler::menuQueue = menuHandler::device_role_picker;
         }
     };
     screen->showOverlayBanner(bannerOptions);

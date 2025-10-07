@@ -113,12 +113,6 @@ meshtastic_MeshPacket *NodeInfoModule::allocReply()
             u.public_key.size = 0;
         }
 
-        // FIXME: Clear the user.id field since it should be derived from node number on the receiving end
-        // u.id[0] = '\0';
-
-        // Ensure our user.id is derived correctly
-        strcpy(u.id, nodeDB->getNodeId().c_str());
-
         // Clear the user.id field since it should be derived from node number on the receiving end
         u.id[0] = '\0';
         LOG_INFO("Send owner %s/%s/%s", u.id, u.long_name, u.short_name);

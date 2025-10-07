@@ -1298,67 +1298,7 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
                 uint32_t mins = (delta % 3600) / 60;
                 uint32_t secs = delta % 60;
 
-        if (uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_OLC &&
-            uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_MLS) {
-            // === Fourth Row: Line 2 GPS Info ===
-            UIRenderer::drawGpsCoordinates(display, x, getTextPositions(display)[line++], gpsStatus, "line2");
-        }
-
-        // === Final Row: Altitude ===
-        char altitudeLine[32] = {0};
-        int32_t alt = (strcmp(displayLine, "Phone GPS") == 0 && ourNode && nodeDB->hasValidPosition(ourNode))
-                          ? ourNode->position.altitude
-                          : geoCoord.getAltitude();
-        if (config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL) {
-            snprintf(altitudeLine, sizeof(altitudeLine), "Alt: %.0fft", alt * METERS_TO_FEET);
-        } else {
-            snprintf(altitudeLine, sizeof(altitudeLine), "Alt: %.0im", alt);
-        }
-        display->drawString(x, getTextPositions(display)[line++], altitudeLine);
-    }
-#if !defined(M5STACK_UNITC6L)
-    // === Draw Compass if heading is valid ===
-    if (validHeading) {
-        // --- Compass Rendering: landscape (wide) screens use original side-aligned logic ---
-        if (SCREEN_WIDTH > SCREEN_HEIGHT) {
-            const int16_t topY = getTextPositions(display)[1];
-            const int16_t bottomY = SCREEN_HEIGHT - (FONT_HEIGHT_SMALL - 1); // nav row height
-            const int16_t usableHeight = bottomY - topY - 5;
-
-            int16_t compassRadius = usableHeight / 2;
-            if (compassRadius < 8)
-                compassRadius = 8;
-            const int16_t compassDiam = compassRadius * 2;
-            const int16_t compassX = x + SCREEN_WIDTH - compassRadius - 8;
-
-            // Center vertically and nudge down slightly to keep "N" clear of header
-            const int16_t compassY = topY + (usableHeight / 2) + ((FONT_HEIGHT_SMALL - 1) / 2) + 2;
-
-            CompassRenderer::drawNodeHeading(display, compassX, compassY, compassDiam, -heading);
-            display->drawCircle(compassX, compassY, compassRadius);
-
-            // "N" label
-            float northAngle = 0;
-            if (uiconfig.compass_mode != meshtastic_CompassMode_FIXED_RING)
-                northAngle = -heading;
-            float radius = compassRadius;
-            int16_t nX = compassX + (radius - 1) * sin(northAngle);
-            int16_t nY = compassY - (radius - 1) * cos(northAngle);
-            int16_t nLabelWidth = display->getStringWidth("N") + 2;
-            int16_t nLabelHeightBox = FONT_HEIGHT_SMALL + 1;
-
-            display->setColor(BLACK);
-            display->fillRect(nX - nLabelWidth / 2, nY - nLabelHeightBox / 2, nLabelWidth, nLabelHeightBox);
-            display->setColor(WHITE);
-            display->setFont(FONT_SMALL);
-            display->setTextAlignment(TEXT_ALIGN_CENTER);
-            display->drawString(nX, nY - FONT_HEIGHT_SMALL / 2, "N");
-        } else {
-            // Portrait or square: put compass at the bottom and centered, scaled to fit available space
-            // For E-Ink screens, account for navigation bar at the bottom!
-            int yBelowContent = getTextPositions(display)[5] + FONT_HEIGHT_SMALL + 2;
-            const int margin = 4;
-            int availableHeight =
+                char buf[32];
 #if defined(USE_EINK)
                 // E-Ink: skip seconds, show only days/hours/mins
                 if (days > 0) {

@@ -75,3 +75,38 @@ bool TextMessageModule::wantPacket(const meshtastic_MeshPacket *p)
 {
     return MeshService::isTextPayload(p);
 }
+
+// === Nuevo: enviar texto y guardarlo en el historial ===
+bool TextMessageModule::sendText(uint32_t to, uint8_t channel, const std::string &text)
+{
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (!p)
+        return false;
+
+    p->to = to;
+    p->channel = channel;
+
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->decoded.payload.size = text.size();
+    memcpy(p->decoded.payload.bytes, text.data(), text.size());
+
+    // seend to mesh
+    if (service) {
+        service->sendToMesh(p);
+    }
+
+    // store in chat history
+    if (isBroadcast(to)) {
+        chat::ChatHistoryStore::instance().addCHAN(channel, nodeDB ? nodeDB->getNodeNum() : 0,
+                                                   /*outgoing=*/true, text, millis() / 1000);
+        // Auto-scroll to newest message when sending to channel
+        graphics::resetScrollToTop(channel, false);
+    } else {
+        chat::ChatHistoryStore::instance().addDM(to,
+                                                 /*outgoing=*/true, text, millis() / 1000);
+        // Auto-scroll to newest message when sending DM
+        graphics::resetScrollToTop(to, true);
+    }
+
+    return true;
+}
