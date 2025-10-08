@@ -1,6 +1,7 @@
 #include "configuration.h"
-#if HAS_SCREEN
+#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
 #include "ClockRenderer.h"
+#include "FSCommon.h"
 #include "GPS.h"
 #include "MenuHandler.h"
 #include "MeshRadio.h"
@@ -16,12 +17,51 @@
 #include "mesh/MeshTypes.h"
 #include "modules/AdminModule.h"
 #include "modules/CannedMessageModule.h"
+#include "modules/ChatHistoryStore.h"
 #include "modules/KeyVerificationModule.h"
+#include <set>
 
+#endif
+#include "NotificationRenderer.h"
 #include "modules/TraceRouteModule.h"
 #include <functional>
+#if !defined(ARCH_PORTDUINO) && !MESHTASTIC_EXCLUDE_I2C
+#include "input/cardKbI2cImpl.h"
+#endif
+
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+#include <WiFi.h>
+#include <algorithm>
+#include <vector>
+#endif
 
 extern uint16_t TFT_MESH;
+extern uint16_t TFT_MESH_r;
+extern uint16_t TFT_MESH_g;
+extern uint16_t TFT_MESH_b;
+
+extern CannedMessageModule *cannedMessageModule;
+extern bool kb_found;
+
+// External variables from Screen.cpp
+struct ScrollState {
+    int sel = 0;         // selected line (0..visible-1)
+    int scrollIndex = 0; // first visible message (sliding window)
+    int offset = 0;      // horizontal offset (characters)
+    uint32_t lastMs = 0; // last update
+};
+
+extern std::string g_pendingKeyboardHeader;
+extern std::set<uint8_t> g_favChannelTabs;
+extern std::map<uint32_t, ScrollState> g_nodeScroll;
+extern std::map<uint8_t, ScrollState> g_chanScroll;
+
+// External variables for chat functionality
+extern bool g_chatSilentMode;
+
+// Toggle global scroll for chat frames
+bool g_chatScrollByPress = true;
+bool g_chatScrollUpDown = true; // true = LEFT, false = RIGHT (for message navigation)
 
 namespace graphics
 {
@@ -29,14 +69,27 @@ menuHandler::screenMenus menuHandler::menuQueue = menu_none;
 bool test_enabled = false;
 uint8_t test_count = 0;
 
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+// SSID password required for WiFi config menu
+static String s_wifiPendingSSID;
+#endif
+
 void menuHandler::loraMenu()
 {
-    static const char *optionsArray[] = {"Back", "Device Role", "Radio Preset", "LoRa Region"};
-    enum optionsNumbers { Back = 0, device_role_picker = 1, radio_preset_picker = 2, lora_picker = 3 };
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    static const char *optionsArray[] = {"Back", "Device Role", "Radio Preset", "LoRa Region", "WiFi Config", "MQTT Config"};
+    enum optionsNumbers {
+        Back = 0,
+        device_role_picker = 1,
+        radio_preset_picker = 2,
+        lora_picker = 3,
+        wifi_config_menu = 4,
+        mqtt_base_menu = 5
+    };
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "LoRa Actions";
     bannerOptions.optionsArrayPtr = optionsArray;
-    bannerOptions.optionsCount = 4;
+    bannerOptions.optionsCount = 6;
     bannerOptions.bannerCallback = [](int selected) -> void {
         if (selected == Back) {
             // No action
@@ -47,8 +100,38 @@ void menuHandler::loraMenu()
         } else if (selected == lora_picker) {
             menuHandler::menuQueue = menuHandler::lora_picker;
         }
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+        else if (selected == wifi_config_menu) {
+            // Close this banner and launch the WiFi menu in the loop
+            NotificationRenderer::pauseBanner = true;
+            NotificationRenderer::alertBannerUntil = 1;
+            NotificationRenderer::optionsArrayPtr = nullptr;
+            NotificationRenderer::optionsEnumPtr = nullptr;
+            menuHandler::menuQueue = menuHandler::wifi_base_menu;
+        } else if (selected == mqtt_base_menu) {
+            menuHandler::menuQueue = menuHandler::mqtt_base_menu;
+        }
+#endif
     };
     screen->showOverlayBanner(bannerOptions);
+#else
+    static const char *optionsArray[] = {"Back", "Region Picker", "Device Role"};
+    enum optionsNumbers { Back = 0, lora_picker = 1, device_role_picker = 2 };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "LoRa Actions";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Back) {
+            // No action
+        } else if (selected == lora_picker) {
+            menuHandler::menuQueue = menuHandler::lora_picker;
+        } else if (selected == device_role_picker) {
+            menuHandler::menuQueue = menuHandler::device_role_picker;
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+#endif
 }
 
 void menuHandler::OnboardMessage()
@@ -156,6 +239,226 @@ void menuHandler::LoraRegionPicker(uint32_t duration)
         }
     };
     screen->showOverlayBanner(bannerOptions);
+}
+
+#if HAS_WIFI
+void menuHandler::wifiBaseMenu()
+{
+    enum optionsNumbers { Back, Toggle, Scan, Status };
+
+    static const char *optionsArray[] = {"Back", "WiFi Toggle", "Scan Networks", "Status"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "WiFi Menu";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 4;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Toggle) {
+            menuQueue = wifi_toggle_menu;
+            screen->runNow();
+        } else if (selected == Scan) {
+            menuQueue = wifi_scan_menu;
+            screen->runNow();
+        } else if (selected == Status) {
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+            screen->openWifiInfoScreen();
+#endif
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+#endif
+
+#if HAS_WIFI
+void menuHandler::wifiToggleMenu()
+{
+    enum optionsNumbers { Back, Enabled, Disabled };
+
+    static const char *optionsArray[] = {"Back", "Enabled", "Disabled"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Toggle WiFi";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Enabled) {
+            config.network.wifi_enabled = true;
+            config.bluetooth.enabled = false;
+            service->reloadConfig(SEGMENT_CONFIG);
+            rebootAtMsec = (millis() + DEFAULT_REBOOT_SECONDS * 1000);
+        } else if (selected == Disabled) {
+            config.network.wifi_enabled = false;
+            config.bluetooth.enabled = true;
+            service->reloadConfig(SEGMENT_CONFIG);
+            rebootAtMsec = (millis() + DEFAULT_REBOOT_SECONDS * 1000);
+        }
+    };
+    // Set initial selection based on current WiFi state: default to Disabled (OFF)
+    bannerOptions.InitialSelected = config.network.wifi_enabled ? Enabled : Disabled;
+    screen->showOverlayBanner(bannerOptions);
+}
+#endif
+
+void menuHandler::wifiScanMenu()
+{
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    // close any keyboard that might be open
+    if (NotificationRenderer::virtualKeyboard) {
+        delete NotificationRenderer::virtualKeyboard;
+        NotificationRenderer::virtualKeyboard = nullptr;
+    }
+
+    // Show scanning banner
+    if (screen)
+        screen->showSimpleBanner("Scanning...", 3000);
+
+    // Wifi scan - handle platform differences
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    delay(100); // Increase delay for better scanning
+
+    // Platform-specific WiFi scanning
+#if defined(ARCH_RP2040) || defined(RPI_PICO)
+    // RP2040/Pico W uses single parameter scanNetworks()
+    int n = WiFi.scanNetworks();
+#else
+    // ESP32 and other platforms may use two parameters
+    int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+#endif
+
+    struct AP {
+        String ssid;
+        int rssi;
+        bool open;
+    };
+    std::vector<AP> aps;
+    aps.reserve(n > 0 ? n : 0);
+
+    for (int i = 0; i < n; ++i) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0)
+            continue;
+        int rssi = WiFi.RSSI(i);
+
+        // Platform-specific encryption type check
+        // Try to detect open networks - different platforms use different constants
+        bool open = false;
+        uint8_t encType = WiFi.encryptionType(i);
+
+#if defined(ARCH_RP2040) || defined(RPI_PICO)
+        // RP2040/Pico W typically uses 0 for open networks
+        open = (encType == 0);
+#elif defined(ARCH_ESP32) || defined(ESP32)
+        // ESP32 uses WIFI_AUTH_OPEN constant
+        open = (encType == WIFI_AUTH_OPEN);
+#else
+        // Generic fallback - assume 0 means open for most platforms
+        open = (encType == 0);
+#endif
+
+        auto it = std::find_if(aps.begin(), aps.end(), [&](const AP &a) { return a.ssid == ssid; });
+        if (it == aps.end())
+            aps.push_back({ssid, rssi, open});
+        else if (rssi > it->rssi) {
+            it->rssi = rssi;
+            it->open = open;
+        }
+    }
+
+    std::sort(aps.begin(), aps.end(), [](const AP &a, const AP &b) { return a.rssi > b.rssi; });
+    const int MAX_SHOW = 12;
+    static char labels[MAX_SHOW + 3][40];
+    static const char *options[MAX_SHOW + 3];
+
+    int count = 0;
+    int apShown = (int)std::min(aps.size(), (size_t)MAX_SHOW);
+    for (int i = 0; i < apShown; ++i) {
+        const auto &ap = aps[i];
+        String ss = ap.ssid;
+        if (ss.length() > 22)
+            ss = ss.substring(0, 19) + "...";
+        snprintf(labels[count], sizeof(labels[count]), "%s", ss.c_str());
+        options[count++] = labels[i];
+    }
+
+    if (apShown == 0) {
+        snprintf(labels[count], sizeof(labels[count]), "No networks");
+        options[count] = labels[count];
+        count++;
+    }
+
+    int rescanIdx = count;
+    options[count++] = "Rescan";
+    int backIdx = count;
+    options[count++] = "Back";
+
+    static std::vector<AP> s_aps;
+    static int s_apShown, s_rescanIdx, s_backIdx;
+    s_aps = aps;
+    s_apShown = apShown;
+    s_rescanIdx = rescanIdx;
+    s_backIdx = backIdx;
+
+    BannerOverlayOptions o;
+    o.message = "WiFi Networks";
+    o.durationMs = 0;
+    o.optionsArrayPtr = options;
+    o.optionsCount = count;
+    o.optionsEnumPtr = nullptr; // we return index
+
+    o.bannerCallback = [](int sel) {
+        if (sel == s_rescanIdx) {
+            menuHandler::menuQueue = menuHandler::wifi_scan_menu;
+            if (screen)
+                screen->forceDisplay(true);
+            return;
+        }
+        if (sel == s_backIdx) {
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            return;
+        }
+
+        if (s_apShown == 0)
+            return;
+        if (sel < 0 || sel >= s_apShown)
+            return;
+
+        const String ssidSel = s_aps[sel].ssid;
+        const bool open = s_aps[sel].open;
+
+        if (open) {
+            menuHandler::showConfirmationBanner("Open network. Connect?", [ssidSel]() {
+                config.network.wifi_enabled = true;
+                strlcpy(config.network.wifi_ssid, ssidSel.c_str(), sizeof(config.network.wifi_ssid));
+                config.network.wifi_psk[0] = '\0';
+                service->reloadConfig(SEGMENT_CONFIG);
+
+                WiFi.mode(WIFI_STA);
+                WiFi.disconnect(true);
+                delay(50);
+                WiFi.begin(ssidSel.c_str());
+                if (screen)
+                    screen->showSimpleBanner("Connecting...", 2000);
+            });
+            return;
+        }
+
+        // required password
+        NotificationRenderer::pauseBanner = true;
+        NotificationRenderer::alertBannerUntil = 1;
+        NotificationRenderer::optionsArrayPtr = nullptr;
+        NotificationRenderer::optionsEnumPtr = nullptr;
+
+        s_wifiPendingSSID = ssidSel;
+        menuHandler::menuQueue = menuHandler::wifi_password_prompt;
+        if (screen)
+            screen->forceDisplay(true);
+    };
+
+    screen->showOverlayBanner(o);
+#else
+    if (screen)
+        screen->showSimpleBanner("WiFi not available", 2000);
+#endif
 }
 
 void menuHandler::DeviceRolePicker()
@@ -382,9 +685,23 @@ void menuHandler::clockMenu()
 {
 #if defined(M5STACK_UNITC6L)
     static const char *optionsArray[] = {"Back", "Time Format", "Timezone"};
+    enum optionsNumbers { Back = 0, Time = 1, Timezone = 2 };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Clock";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Time) {
+            menuHandler::menuQueue = menuHandler::twelve_hour_picker;
+            screen->runNow();
+        } else if (selected == Timezone) {
+            menuHandler::menuQueue = menuHandler::TZ_picker;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
 #else
     static const char *optionsArray[] = {"Back", "Clock Face", "Time Format", "Timezone"};
-#endif
     enum optionsNumbers { Back = 0, Clock = 1, Time = 2, Timezone = 3 };
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Clock Action";
@@ -403,23 +720,30 @@ void menuHandler::clockMenu()
         }
     };
     screen->showOverlayBanner(bannerOptions);
+#endif
 }
 
 void menuHandler::messageResponseMenu()
 {
-    enum optionsNumbers { Back = 0, Dismiss = 1, Preset = 2, Freetext = 3, Aloud = 4, enumEnd = 5 };
+    enum optionsNumbers { Back = 0, Dismiss = 1, Preset = 2, Freetext = 3, Emote = 4, Aloud = 5, enumEnd = 6 };
 #if defined(M5STACK_UNITC6L)
     static const char *optionsArray[enumEnd] = {"Back", "Dismiss", "Reply Preset"};
-#else
-    static const char *optionsArray[enumEnd] = {"Back", "Dismiss", "Reply via Preset"};
-#endif
     static int optionsEnumArray[enumEnd] = {Back, Dismiss, Preset};
     int options = 3;
+#else
+    static const char *optionsArray[enumEnd] = {"Back", "Dismiss", "Reply via Preset"};
+    static int optionsEnumArray[enumEnd] = {Back, Dismiss, Preset};
+    int options = 3;
+#endif
 
     if (kb_found) {
         optionsArray[options] = "Reply via Freetext";
         optionsEnumArray[options++] = Freetext;
     }
+
+    // Always add emote option since it works without keyboard
+    optionsArray[options] = "Reply via Emote";
+    optionsEnumArray[options++] = Emote;
 
 #ifdef HAS_I2S
     optionsArray[options] = "Read Aloud";
@@ -449,6 +773,12 @@ void menuHandler::messageResponseMenu()
             } else {
                 cannedMessageModule->LaunchFreetextWithDestination(devicestate.rx_text_message.from);
             }
+        } else if (selected == Emote) {
+            if (devicestate.rx_text_message.to == NODENUM_BROADCAST) {
+                cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST, devicestate.rx_text_message.channel);
+            } else {
+                cannedMessageModule->LaunchEmoteWithDestination(devicestate.rx_text_message.from);
+            }
         }
 #ifdef HAS_I2S
         else if (selected == Aloud) {
@@ -464,7 +794,7 @@ void menuHandler::messageResponseMenu()
 
 void menuHandler::homeBaseMenu()
 {
-    enum optionsNumbers { Back, Backlight, Position, Preset, Freetext, Sleep, enumEnd };
+    enum optionsNumbers { Back, Backlight, Position, Preset, Freetext, Emote, Sleep, enumEnd };
 
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
@@ -487,17 +817,20 @@ void menuHandler::homeBaseMenu()
     optionsArray[options] = "New Preset";
 #else
     optionsArray[options] = "New Preset Msg";
-#endif
     optionsEnumArray[options++] = Preset;
+#endif
     if (kb_found) {
         optionsArray[options] = "New Freetext Msg";
         optionsEnumArray[options++] = Freetext;
     }
-
-    BannerOverlayOptions bannerOptions;
+    // Always add emote option since it works without keyboard
+    optionsArray[options] = "New Emote Msg";
 #if defined(M5STACK_UNITC6L)
     bannerOptions.message = "Home";
 #else
+    optionsEnumArray[options++] = Emote;
+
+    BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Home Action";
 #endif
     bannerOptions.optionsArrayPtr = optionsArray;
@@ -525,7 +858,8 @@ void menuHandler::homeBaseMenu()
             saveUIConfig();
 #endif
         } else if (selected == Sleep) {
-            screen->setOn(false);
+            menuHandler::menuQueue = menuHandler::sleep_menu;
+            screen->runNow();
         } else if (selected == Position) {
             InputEvent event = {.inputEvent = (input_broker_event)INPUT_BROKER_SEND_PING, .kbchar = 0, .touchX = 0, .touchY = 0};
             inputBroker->injectInputEvent(&event);
@@ -533,19 +867,16 @@ void menuHandler::homeBaseMenu()
             cannedMessageModule->LaunchWithDestination(NODENUM_BROADCAST);
         } else if (selected == Freetext) {
             cannedMessageModule->LaunchFreetextWithDestination(NODENUM_BROADCAST);
+        } else if (selected == Emote) {
+            cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST);
         }
     };
     screen->showOverlayBanner(bannerOptions);
 }
 
-void menuHandler::textMessageMenu()
-{
-    cannedMessageModule->LaunchWithDestination(NODENUM_BROADCAST);
-}
-
 void menuHandler::textMessageBaseMenu()
 {
-    enum optionsNumbers { Back, Preset, Freetext, enumEnd };
+    enum optionsNumbers { Back, Preset, Freetext, Emote, enumEnd };
 
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
@@ -556,6 +887,9 @@ void menuHandler::textMessageBaseMenu()
         optionsArray[options] = "New Freetext Msg";
         optionsEnumArray[options++] = Freetext;
     }
+    // Always add emote option since it works without keyboard
+    optionsArray[options] = "New Emote Msg";
+    optionsEnumArray[options++] = Emote;
 
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Message Action";
@@ -564,7 +898,8 @@ void menuHandler::textMessageBaseMenu()
     bannerOptions.optionsCount = options;
     bannerOptions.bannerCallback = [](int selected) -> void {
         if (selected == Preset) {
-            cannedMessageModule->LaunchWithDestination(NODENUM_BROADCAST);
+        } else if (selected == Emote) {
+            cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST);
         } else if (selected == Freetext) {
             cannedMessageModule->LaunchFreetextWithDestination(NODENUM_BROADCAST);
         }
@@ -574,10 +909,14 @@ void menuHandler::textMessageBaseMenu()
 
 void menuHandler::systemBaseMenu()
 {
-    enum optionsNumbers { Back, Notifications, ScreenOptions, Bluetooth, PowerMenu, FrameToggles, Test, enumEnd };
+    enum optionsNumbers { Back, SilentMode, Notifications, ScreenOptions, Bluetooth, PowerMenu, FrameToggles, Test, enumEnd };
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
     int options = 1;
+
+    // Silent Mode for chats
+    optionsArray[options] = g_chatSilentMode ? "Silent Mode: ON" : "Silent Mode: OFF";
+    optionsEnumArray[options++] = SilentMode;
 
     optionsArray[options] = "Notifications";
     optionsEnumArray[options++] = Notifications;
@@ -593,8 +932,8 @@ void menuHandler::systemBaseMenu()
     optionsArray[options] = "Bluetooth";
 #else
     optionsArray[options] = "Bluetooth Toggle";
-#endif
     optionsEnumArray[options++] = Bluetooth;
+#endif
 #if defined(M5STACK_UNITC6L)
     optionsArray[options] = "Power";
 #else
@@ -617,7 +956,12 @@ void menuHandler::systemBaseMenu()
     bannerOptions.optionsCount = options;
     bannerOptions.optionsEnumPtr = optionsEnumArray;
     bannerOptions.bannerCallback = [](int selected) -> void {
-        if (selected == Notifications) {
+        if (selected == SilentMode) {
+            g_chatSilentMode = !g_chatSilentMode;
+            // Refresh menu to show updated state
+            menuHandler::menuQueue = menuHandler::system_base_menu;
+            screen->runNow();
+        } else if (selected == Notifications) {
             menuHandler::menuQueue = menuHandler::notifications_menu;
             screen->runNow();
         } else if (selected == ScreenOptions) {
@@ -647,7 +991,7 @@ void menuHandler::systemBaseMenu()
 
 void menuHandler::favoriteBaseMenu()
 {
-    enum optionsNumbers { Back, Preset, Freetext, Remove, TraceRoute, enumEnd };
+    enum optionsNumbers { Back, Preset, Freetext, Emote, Remove, TraceRoute, enumEnd };
 #if defined(M5STACK_UNITC6L)
     static const char *optionsArray[enumEnd] = {"Back", "New Preset"};
 #else
@@ -660,6 +1004,9 @@ void menuHandler::favoriteBaseMenu()
         optionsArray[options] = "New Freetext Msg";
         optionsEnumArray[options++] = Freetext;
     }
+    // Always add emote option since it works without keyboard
+    optionsArray[options] = "New Emote Msg";
+    optionsEnumArray[options++] = Emote;
 #if !defined(M5STACK_UNITC6L)
     optionsArray[options] = "Trace Route";
     optionsEnumArray[options++] = TraceRoute;
@@ -672,7 +1019,6 @@ void menuHandler::favoriteBaseMenu()
     bannerOptions.message = "Favorites";
 #else
     bannerOptions.message = "Favorites Action";
-#endif
     bannerOptions.optionsArrayPtr = optionsArray;
     bannerOptions.optionsEnumPtr = optionsEnumArray;
     bannerOptions.optionsCount = options;
@@ -681,6 +1027,8 @@ void menuHandler::favoriteBaseMenu()
             cannedMessageModule->LaunchWithDestination(graphics::UIRenderer::currentFavoriteNodeNum);
         } else if (selected == Freetext) {
             cannedMessageModule->LaunchFreetextWithDestination(graphics::UIRenderer::currentFavoriteNodeNum);
+        } else if (selected == Emote) {
+            cannedMessageModule->LaunchEmoteWithDestination(graphics::UIRenderer::currentFavoriteNodeNum);
         } else if (selected == Remove) {
             menuHandler::menuQueue = menuHandler::remove_favorite;
             screen->runNow();
@@ -690,6 +1038,7 @@ void menuHandler::favoriteBaseMenu()
             }
         }
     };
+#endif
     screen->showOverlayBanner(bannerOptions);
 }
 
@@ -736,6 +1085,7 @@ void menuHandler::nodeListMenu()
 #else
     static const char *optionsArray[] = {"Back", "Add Favorite", "Trace Route", "Key Verification", "Reset NodeDB"};
 #endif
+
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Node Action";
     bannerOptions.optionsArrayPtr = optionsArray;
@@ -1229,42 +1579,141 @@ void menuHandler::numberTest()
                              [](int number_picked) -> void { LOG_WARN("Nodenum: %u", number_picked); });
 }
 
-void menuHandler::wifiBaseMenu()
+void menuHandler::wifiConfigMenu()
 {
-    enum optionsNumbers { Back, Wifi_toggle };
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    // close any keyboard that might be open
+    if (NotificationRenderer::virtualKeyboard) {
+        delete NotificationRenderer::virtualKeyboard;
+        NotificationRenderer::virtualKeyboard = nullptr;
+    }
 
-    static const char *optionsArray[] = {"Back", "WiFi Toggle"};
-    BannerOverlayOptions bannerOptions;
-    bannerOptions.message = "WiFi Menu";
-    bannerOptions.optionsArrayPtr = optionsArray;
-    bannerOptions.optionsCount = 2;
-    bannerOptions.bannerCallback = [](int selected) -> void {
-        if (selected == Wifi_toggle) {
-            menuQueue = wifi_toggle_menu;
-            screen->runNow();
-        }
+    // Wifi scan
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    delay(60);
+    int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+
+    struct AP {
+        String ssid;
+        int rssi;
+        bool open;
     };
-    screen->showOverlayBanner(bannerOptions);
-}
+    std::vector<AP> aps;
+    aps.reserve(n > 0 ? n : 0);
 
-void menuHandler::wifiToggleMenu()
-{
-    enum optionsNumbers { Back, Wifi_toggle };
+    for (int i = 0; i < n; ++i) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0)
+            continue;
+        int rssi = WiFi.RSSI(i);
+        bool open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
 
-    static const char *optionsArray[] = {"Back", "Disable"};
-    BannerOverlayOptions bannerOptions;
-    bannerOptions.message = "Disable Wifi and\nEnable Bluetooth?";
-    bannerOptions.optionsArrayPtr = optionsArray;
-    bannerOptions.optionsCount = 2;
-    bannerOptions.bannerCallback = [](int selected) -> void {
-        if (selected == Wifi_toggle) {
-            config.network.wifi_enabled = false;
-            config.bluetooth.enabled = true;
-            service->reloadConfig(SEGMENT_CONFIG);
-            rebootAtMsec = (millis() + DEFAULT_REBOOT_SECONDS * 1000);
+        auto it = std::find_if(aps.begin(), aps.end(), [&](const AP &a) { return a.ssid == ssid; });
+        if (it == aps.end())
+            aps.push_back({ssid, rssi, open});
+        else if (rssi > it->rssi) {
+            it->rssi = rssi;
+            it->open = open;
         }
+    }
+
+    std::sort(aps.begin(), aps.end(), [](const AP &a, const AP &b) { return a.rssi > b.rssi; });
+    const int MAX_SHOW = 12;
+    static char labels[MAX_SHOW + 3][40];
+    static const char *options[MAX_SHOW + 3];
+
+    int count = 0;
+    int apShown = (int)std::min(aps.size(), (size_t)MAX_SHOW);
+    for (int i = 0; i < apShown; ++i) {
+        const auto &ap = aps[i];
+        String ss = ap.ssid;
+        if (ss.length() > 22)
+            ss = ss.substring(0, 19) + "...";
+        snprintf(labels[count], sizeof(labels[count]), "%s", ss.c_str());
+        options[count++] = labels[i];
+    }
+
+    if (apShown == 0) {
+        snprintf(labels[count], sizeof(labels[count]), "No networks");
+        options[count] = labels[count];
+    }
+
+    int rescanIdx = count;
+    options[count++] = "Rescan";
+    int backIdx = count;
+    options[count++] = "Back";
+
+    static std::vector<AP> s_aps;
+    static int s_apShown, s_rescanIdx, s_backIdx;
+    s_aps = aps;
+    s_apShown = apShown;
+    s_rescanIdx = rescanIdx;
+    s_backIdx = backIdx;
+
+    BannerOverlayOptions o;
+    o.message = "WiFi Networks";
+    o.durationMs = 0;
+    o.optionsArrayPtr = options;
+    o.optionsCount = count;
+    o.optionsEnumPtr = nullptr; // we return index
+
+    o.bannerCallback = [](int sel) {
+        if (sel == s_rescanIdx) {
+            menuHandler::menuQueue = menuHandler::wifi_config_menu;
+            if (screen)
+                screen->forceDisplay(true);
+            return;
+        }
+        if (sel == s_backIdx) {
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            return;
+        }
+
+        if (s_apShown == 0)
+            return;
+        if (sel < 0 || sel >= s_apShown)
+            return;
+
+        const String ssidSel = s_aps[sel].ssid;
+        const bool open = s_aps[sel].open;
+
+        if (open) {
+            menuHandler::showConfirmationBanner("Open network. Connect?", [ssidSel]() {
+                config.network.wifi_enabled = true;
+                strlcpy(config.network.wifi_ssid, ssidSel.c_str(), sizeof(config.network.wifi_ssid));
+                config.network.wifi_psk[0] = '\0';
+                service->reloadConfig(SEGMENT_CONFIG);
+
+                WiFi.mode(WIFI_STA);
+                WiFi.disconnect(true);
+                delay(50);
+                WiFi.begin(ssidSel.c_str());
+                if (screen)
+                    screen->showSimpleBanner("Connecting...", 2000);
+            });
+            return;
+        }
+
+        // required password
+        NotificationRenderer::pauseBanner = true;
+        NotificationRenderer::alertBannerUntil = 1;
+        NotificationRenderer::optionsArrayPtr = nullptr;
+        NotificationRenderer::optionsEnumPtr = nullptr;
+        NotificationRenderer::alertBannerOptions = 0;
+
+        s_wifiPendingSSID = ssidSel;
+        menuHandler::menuQueue = graphics::menuHandler::wifi_password_prompt;
+        if (screen)
+            screen->forceDisplay(true);
     };
-    screen->showOverlayBanner(bannerOptions);
+
+    screen->showOverlayBanner(o);
+#else
+    if (screen)
+        screen->showSimpleBanner("WiFi not available", 2000);
+#endif
 }
 
 void menuHandler::notificationsMenu()
@@ -1304,9 +1753,9 @@ void menuHandler::screenOptionsMenu()
     hasSupportBrightness = false;
 #endif
 
-    enum optionsNumbers { Back, Brightness, ScreenColor };
-    static const char *optionsArray[4] = {"Back"};
-    static int optionsEnumArray[4] = {Back};
+    enum optionsNumbers { Back, Brightness, ScreenColor, SleepTimer };
+    static const char *optionsArray[5] = {"Back"};
+    static int optionsEnumArray[5] = {Back};
     int options = 1;
 
     // Only show brightness for B&W displays
@@ -1321,6 +1770,10 @@ void menuHandler::screenOptionsMenu()
     optionsEnumArray[options++] = ScreenColor;
 #endif
 
+    // Add Sleep Timer option
+    optionsArray[options] = "Sleep Timer";
+    optionsEnumArray[options++] = SleepTimer;
+
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Screen Options";
     bannerOptions.optionsArrayPtr = optionsArray;
@@ -1332,6 +1785,9 @@ void menuHandler::screenOptionsMenu()
             screen->runNow();
         } else if (selected == ScreenColor) {
             menuHandler::menuQueue = menuHandler::tftcolormenupicker;
+            screen->runNow();
+        } else if (selected == SleepTimer) {
+            menuHandler::menuQueue = menuHandler::sleep_menu;
             screen->runNow();
         } else {
             menuQueue = system_base_menu;
@@ -1365,7 +1821,6 @@ void menuHandler::powerMenu()
     bannerOptions.message = "Power";
 #else
     bannerOptions.message = "Reboot / Shutdown";
-#endif
     bannerOptions.optionsArrayPtr = optionsArray;
     bannerOptions.optionsCount = options;
     bannerOptions.optionsEnumPtr = optionsEnumArray;
@@ -1576,74 +2031,259 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
         GPSFormatMenu();
         break;
 #endif
-    case compass_point_north_menu:
-        compassNorthMenu();
+    case sleep_menu:
+        sleepMenu();
         break;
-    case reset_node_db_menu:
-        resetNodeDBMenu();
+    case sleep_timer_config:
+        sleepTimerConfig();
         break;
-    case buzzermodemenupicker:
-        BuzzerModeMenu();
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    case mqtt_base_menu:
+        mqttBaseMenu();
         break;
-    case mui_picker:
-        switchToMUIMenu();
+    case mqtt_toggle_menu:
+        mqttToggleMenu();
         break;
-    case tftcolormenupicker:
-        TFTColorPickerMenu(display);
+    case mqtt_server_config:
+        mqttServerConfig();
         break;
-    case brightness_picker:
-        BrightnessPickerMenu();
+    case mqtt_credentials_config:
+        mqttCredentialsConfig();
         break;
-    case reboot_menu:
-        rebootMenu();
+#endif
         break;
-    case shutdown_menu:
-        shutdownMenu();
-        break;
-    case add_favorite:
-        addFavoriteMenu();
-        break;
-    case remove_favorite:
-        removeFavoriteMenu();
-        break;
-    case trace_route_menu:
-        traceRouteMenu();
-        break;
-    case test_menu:
-        testMenu();
-        break;
-    case number_test:
-        numberTest();
-        break;
-    case wifi_toggle_menu:
-        wifiToggleMenu();
-        break;
-    case key_verification_init:
-        keyVerificationInitMenu();
-        break;
-    case key_verification_final_prompt:
-        keyVerificationFinalPrompt();
-        break;
-    case bluetooth_toggle_menu:
-        BluetoothToggleMenu();
-        break;
-    case notifications_menu:
-        notificationsMenu();
-        break;
-    case screen_options_menu:
-        screenOptionsMenu();
-        break;
-    case power_menu:
-        powerMenu();
-        break;
-    case FrameToggles:
-        FrameToggles_menu();
-        break;
-    case throttle_message:
-        screen->showSimpleBanner("Too Many Attempts\nTry again in 60 seconds.", 5000);
-        break;
+#endif
+case compass_point_north_menu:
+    compassNorthMenu();
+    break;
+case reset_node_db_menu:
+    resetNodeDBMenu();
+    break;
+case buzzermodemenupicker:
+    BuzzerModeMenu();
+    break;
+case mui_picker:
+    switchToMUIMenu();
+    break;
+case tftcolormenupicker:
+    TFTColorPickerMenu(display);
+    break;
+case brightness_picker:
+    BrightnessPickerMenu();
+    break;
+case reboot_menu:
+    rebootMenu();
+    break;
+case shutdown_menu:
+    shutdownMenu();
+    break;
+case add_favorite:
+    addFavoriteMenu();
+    break;
+case remove_favorite:
+    removeFavoriteMenu();
+    break;
+case trace_route_menu:
+    traceRouteMenu();
+    break;
+case test_menu:
+    testMenu();
+    break;
+case number_test:
+    numberTest();
+    break;
+#if HAS_WIFI
+case wifi_toggle_menu:
+    wifiToggleMenu();
+    break;
+#endif
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+case wifi_scan_menu:
+    wifiScanMenu();
+    break;
+#endif
+case key_verification_init:
+    keyVerificationInitMenu();
+    break;
+case key_verification_final_prompt:
+    keyVerificationFinalPrompt();
+    break;
+case bluetooth_toggle_menu:
+    BluetoothToggleMenu();
+    break;
+case notifications_menu:
+    notificationsMenu();
+    break;
+case screen_options_menu:
+    screenOptionsMenu();
+    break;
+case power_menu:
+    powerMenu();
+    break;
+case FrameToggles:
+    FrameToggles_menu();
+    break;
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+case wifi_config_menu:
+    wifiConfigMenu();
+    menuQueue = menu_none;
+    return;
+case wifi_base_menu:
+    wifiBaseMenu();
+    menuQueue = menu_none;
+    return;
+case wifi_password_prompt: {
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "%s", s_wifiPendingSSID.c_str());
+
+    // WiFi password callback function
+    auto wifiPasswordCallback = [](const std::string &pass) {
+        // Ignore empty string (ESC cancellation)
+        if (pass.empty()) {
+            return;
+        }
+        // persistir config
+        config.network.wifi_enabled = true;
+        strlcpy(config.network.wifi_ssid, s_wifiPendingSSID.c_str(), sizeof(config.network.wifi_ssid));
+        strlcpy(config.network.wifi_psk, pass.c_str(), sizeof(config.network.wifi_psk));
+        service->reloadConfig(SEGMENT_CONFIG);
+
+        // Apply now
+        WiFi.mode(WIFI_STA);
+        WiFi.disconnect(true);
+        delay(50);
+        WiFi.begin(s_wifiPendingSSID.c_str(), pass.c_str());
+        if (screen) {
+            // Small delay to ensure the virtual keyboard has fully closed
+            delay(100);
+            // Force reset the notification system to clear any residual state
+            NotificationRenderer::resetBanner();
+            // Ensure banner system is ready
+            NotificationRenderer::pauseBanner = false;
+            screen->showSimpleBanner("Connecting...", 2000);
+        }
+    };
+
+    // Use CardKB-friendly input when CardKB is available
+    if (kb_found && cannedMessageModule) {
+        cannedMessageModule->LaunchFreetextKbPrompt(hdr, "", wifiPasswordCallback);
+    } else {
+        // Activate CardKB if available for fallback
+#if !defined(ARCH_PORTDUINO) && !MESHTASTIC_EXCLUDE_I2C
+        if (!::cardKbI2cImpl) {
+            ::cardKbI2cImpl = new CardKbI2cImpl();
+            ::cardKbI2cImpl->init();
+        }
+#endif
+        screen->showTextInput(hdr, "", 0, wifiPasswordCallback);
     }
     menuQueue = menu_none;
+    return;
+}
+case mqtt_server_prompt: {
+    char hdr[32] = "MQTT Server:";
+
+    auto serverCallback = [](const std::string &server) {
+        // Ignore empty string (ESC cancellation)
+        if (server.empty()) {
+            return;
+        }
+        strlcpy(moduleConfig.mqtt.address, server.c_str(), sizeof(moduleConfig.mqtt.address));
+        service->reloadConfig(SEGMENT_MODULECONFIG);
+        if (screen)
+            screen->showSimpleBanner("Server Saved", 2000);
+    };
+
+    if (kb_found && cannedMessageModule) {
+        cannedMessageModule->LaunchFreetextKbPrompt(hdr, moduleConfig.mqtt.address, serverCallback);
+    } else {
+#if !defined(ARCH_PORTDUINO) && !MESHTASTIC_EXCLUDE_I2C
+        if (!::cardKbI2cImpl) {
+            ::cardKbI2cImpl = new CardKbI2cImpl();
+            ::cardKbI2cImpl->init();
+        }
+#endif
+        screen->showTextInput(hdr, moduleConfig.mqtt.address, 0, serverCallback);
+    }
+    menuQueue = menu_none;
+    return;
+}
+case mqtt_username_prompt: {
+    char hdr[32] = "MQTT Username:";
+
+    auto usernameCallback = [](const std::string &username) {
+        // Ignore empty string (ESC cancellation)
+        if (username.empty()) {
+            return;
+        }
+        strlcpy(moduleConfig.mqtt.username, username.c_str(), sizeof(moduleConfig.mqtt.username));
+        service->reloadConfig(SEGMENT_MODULECONFIG);
+        if (screen)
+            screen->showSimpleBanner("Username Saved", 2000);
+    };
+
+    if (kb_found && cannedMessageModule) {
+        cannedMessageModule->LaunchFreetextKbPrompt(hdr, moduleConfig.mqtt.username, usernameCallback);
+    } else {
+        screen->showTextInput(hdr, moduleConfig.mqtt.username, 0, usernameCallback);
+    }
+    menuQueue = menu_none;
+    return;
+}
+case mqtt_password_prompt: {
+    char hdr[32] = "MQTT Password:";
+
+    auto passwordCallback = [](const std::string &password) {
+        // Ignore empty string (ESC cancellation)
+        if (password.empty()) {
+            return;
+        }
+        strlcpy(moduleConfig.mqtt.password, password.c_str(), sizeof(moduleConfig.mqtt.password));
+        service->reloadConfig(SEGMENT_MODULECONFIG);
+        if (screen)
+            screen->showSimpleBanner("Password Saved", 2000);
+    };
+
+    if (kb_found && cannedMessageModule) {
+        cannedMessageModule->LaunchFreetextKbPrompt(hdr, "********", passwordCallback);
+    } else {
+        screen->showTextInput(hdr, "", 0, passwordCallback);
+    }
+    menuQueue = menu_none;
+    return;
+}
+case mqtt_root_prompt: {
+    char hdr[32] = "MQTT Root Topic:";
+
+    auto rootCallback = [](const std::string &root) {
+        // Ignore empty string (ESC cancellation)
+        if (root.empty()) {
+            return;
+        }
+        strlcpy(moduleConfig.mqtt.root, root.c_str(), sizeof(moduleConfig.mqtt.root));
+        service->reloadConfig(SEGMENT_MODULECONFIG);
+        if (screen)
+            screen->showSimpleBanner("Root Topic Saved", 2000);
+    };
+
+    if (kb_found && cannedMessageModule) {
+        cannedMessageModule->LaunchFreetextKbPrompt(hdr, moduleConfig.mqtt.root, rootCallback);
+    } else {
+        screen->showTextInput(hdr, moduleConfig.mqtt.root, 0, rootCallback);
+    }
+    menuQueue = menu_none;
+    return;
+}
+#endif // HAS_WIFI && !defined(ARCH_PORTDUINO)
+case throttle_message:
+    // Used by KeyVerificationModule for throttle messages
+    // No specific action needed, just break
+    break;
+default:
+    // Default case for unhandled menu items (e.g., WiFi/MQTT on devices without WiFi)
+    break;
+}
+menuQueue = menu_none;
 }
 
 void menuHandler::saveUIConfig()
@@ -1651,6 +2291,552 @@ void menuHandler::saveUIConfig()
     nodeDB->saveProto("/prefs/uiconfig.proto", meshtastic_DeviceUIConfig_size, &meshtastic_DeviceUIConfig_msg, &uiconfig);
 }
 
-} // namespace graphics
-
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+void menuHandler::mqttBaseMenu()
+{
+    enum optionsNumbers { Back, Toggle, ServerConfig, Credentials, Status };
+    static const char *optionsArray[] = {"Back", "MQTT Toggle", "Server Config", "Credentials", "Status"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "MQTT Menu";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 5;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Toggle) {
+            menuQueue = mqtt_toggle_menu;
+            screen->runNow();
+        } else if (selected == ServerConfig) {
+            menuQueue = mqtt_server_config;
+            screen->runNow();
+        } else if (selected == Credentials) {
+            menuQueue = mqtt_credentials_config;
+            screen->runNow();
+        } else if (selected == Status) {
+            // Show detailed MQTT status screen
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+            screen->openMqttInfoScreen();
 #endif
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::mqttServerConfig()
+{
+    enum optionsNumbers { Back, Server, TLS, Encryption, IgnoreMQTT, OKtoMQTT };
+    static char optionsArray[6][32];
+    static const char *optionsPtrArray[6];
+
+    // Build dynamic menu options showing current states
+    strcpy(optionsArray[0], "Back");
+    strcpy(optionsArray[1], "Server Address");
+    snprintf(optionsArray[2], sizeof(optionsArray[2]), "TLS: %s", moduleConfig.mqtt.tls_enabled ? "ON" : "OFF");
+    snprintf(optionsArray[3], sizeof(optionsArray[3]), "Encryption: %s", moduleConfig.mqtt.encryption_enabled ? "ON" : "OFF");
+    snprintf(optionsArray[4], sizeof(optionsArray[4]), "Ignore MQTT: %s", config.lora.ignore_mqtt ? "ON" : "OFF");
+    snprintf(optionsArray[5], sizeof(optionsArray[5]), "OK to MQTT: %s", config.lora.config_ok_to_mqtt ? "ON" : "OFF");
+
+    for (int i = 0; i < 6; i++) {
+        optionsPtrArray[i] = optionsArray[i];
+    }
+
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Server Config";
+    bannerOptions.optionsArrayPtr = optionsPtrArray;
+    bannerOptions.optionsCount = 6;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Server) {
+            menuQueue = mqtt_server_prompt;
+            screen->runNow();
+        } else if (selected == TLS) {
+            moduleConfig.mqtt.tls_enabled = !moduleConfig.mqtt.tls_enabled;
+            service->reloadConfig(SEGMENT_MODULECONFIG);
+            screen->showSimpleBanner(moduleConfig.mqtt.tls_enabled ? "TLS Enabled" : "TLS Disabled", 2000);
+            // Regenerate menu to show updated state
+            menuQueue = mqtt_server_config;
+            screen->runNow();
+        } else if (selected == Encryption) {
+            moduleConfig.mqtt.encryption_enabled = !moduleConfig.mqtt.encryption_enabled;
+            service->reloadConfig(SEGMENT_MODULECONFIG);
+            screen->showSimpleBanner(moduleConfig.mqtt.encryption_enabled ? "Encryption On" : "Encryption Off", 2000);
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::mqttCredentialsConfig()
+{
+    enum optionsNumbers { Back, Username, Password, Root };
+    static const char *optionsArray[] = {"Back", "Username", "Password", "Root Topic"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Credentials";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 4;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Username) {
+            menuQueue = mqtt_username_prompt;
+            screen->runNow();
+        } else if (selected == Password) {
+            menuQueue = mqtt_password_prompt;
+            screen->runNow();
+        } else if (selected == Root) {
+            menuQueue = mqtt_root_prompt;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::mqttToggleMenu()
+{
+    bool currentState = moduleConfig.mqtt.enabled;
+
+    showConfirmationBanner(currentState ? "Disable MQTT?" : "Enable MQTT?", [currentState]() -> void {
+        moduleConfig.mqtt.enabled = !currentState;
+        service->reloadConfig(SEGMENT_MODULECONFIG);
+        screen->showSimpleBanner(!currentState ? "MQTT Enabled" : "MQTT Disabled", 2000);
+    });
+}
+
+#endif // HAS_WIFI && !defined(ARCH_PORTDUINO)
+
+void menuHandler::silentModeToggle()
+{
+    showConfirmationBanner(g_chatSilentMode ? "Disable Silent Mode?" : "Enable Silent Mode?", []() -> void {
+        g_chatSilentMode = !g_chatSilentMode;
+        screen->showSimpleBanner(g_chatSilentMode ? "Silent Mode ON" : "Silent Mode OFF", 2000);
+    });
+}
+
+void menuHandler::sleepMenu()
+{
+    enum optionsNumbers { Back, SleepNow, TimerConfig };
+    static const char *optionsArray[3] = {"Back", "Sleep Now", "Timer Config"};
+    static int optionsEnumArray[3] = {Back, SleepNow, TimerConfig};
+
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Sleep Options";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.optionsEnumPtr = optionsEnumArray;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == SleepNow) {
+            screen->setOn(false);
+        } else if (selected == TimerConfig) {
+            menuHandler::menuQueue = menuHandler::sleep_timer_config;
+            screen->runNow();
+        } else {
+            menuQueue = system_base_menu;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::sleepTimerConfig()
+{
+    enum optionsNumbers { Back, Timer30s, Timer1m, Timer5m, Timer10m };
+    static const char *optionsArray[5] = {"Back", "30 seconds", "1 minute", "5 minutes", "10 minutes"};
+    static int optionsEnumArray[5] = {Back, Timer30s, Timer1m, Timer5m, Timer10m};
+
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Sleep Timer";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 5;
+    bannerOptions.optionsEnumPtr = optionsEnumArray;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        uint32_t timeoutMs = 0;
+        const char *message = "";
+
+        if (selected == Timer30s) {
+            timeoutMs = 30 * 1000;
+            message = "30s Screen Timer Set";
+        } else if (selected == Timer1m) {
+            timeoutMs = 60 * 1000;
+            message = "1m Screen Timer Set";
+        } else if (selected == Timer5m) {
+            timeoutMs = 5 * 60 * 1000;
+            message = "5m Screen Timer Set";
+        } else if (selected == Timer10m) {
+            timeoutMs = 10 * 60 * 1000;
+            message = "10m Screen Timer Set";
+        }
+
+        if (timeoutMs > 0) {
+            // Configure custom timeout
+            config.display.screen_on_secs = timeoutMs / 1000;
+            service->reloadConfig(SEGMENT_CONFIG);
+            screen->showSimpleBanner(message, 2000);
+        } else {
+            menuQueue = sleep_menu;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::openChatActionsForNode(uint32_t nodeId)
+{
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+    // Dynamic options (max 9 visible here)
+    enum {
+        kPreset = 1,
+        kFree = 2,
+        kEmote = 3,
+        kRemove = 4,
+        kRemoveFav = 5,
+        kDeleteNode = 6,
+        kMarkRead = 7,
+        kInfo = 8,
+        kScrollType = 9,
+        kBack = 10,
+        kExit = 11
+    };
+
+    static const char *opts[11];
+    static int enums[11];
+    int count = 0;
+
+    // Preset / Freetext according to CardKB
+    if (kb_found) {
+        opts[count] = "New Freetext Msg";
+        enums[count] = kFree;
+        count++;
+    } else {
+        opts[count] = "New Preset Msg";
+        enums[count] = kPreset;
+        count++;
+    }
+
+    // Always add emote option
+    opts[count] = "New Emote Msg";
+    enums[count] = kEmote;
+    count++;
+
+    // Scroll is always enabled, only show direction option if no CardKB and no rotary encoder
+    static char scrollTypeLabel[24];
+    if (!kb_found && rotaryEncoderInterruptImpl1 == nullptr) {
+        snprintf(scrollTypeLabel, sizeof(scrollTypeLabel), "Scroll Dir: %s", g_chatScrollUpDown ? "LEFT" : "RIGHT");
+        opts[count] = scrollTypeLabel;
+        enums[count] = kScrollType;
+        count++;
+    }
+
+    // Common
+    opts[count] = "Remove Chat";
+    enums[count] = kRemove;
+    count++;
+
+    opts[count] = "Remove Fav";
+    enums[count] = kRemoveFav;
+    count++;
+
+    opts[count] = "Delete Node";
+    enums[count] = kDeleteNode;
+    count++;
+
+    opts[count] = "Mark All Read";
+    enums[count] = kMarkRead;
+    count++;
+
+    opts[count] = "Node Info";
+    enums[count] = kInfo;
+    count++;
+
+    opts[count] = "Back";
+    enums[count] = kBack;
+    count++;
+
+    opts[count] = "Exit";
+    enums[count] = kExit;
+    count++;
+
+    BannerOverlayOptions o;
+    o.message = "Chat Actions";
+    o.durationMs = 0;
+    o.optionsArrayPtr = opts;
+    o.optionsEnumPtr = enums;
+    o.optionsCount = count;
+
+    o.bannerCallback = [nodeId](int sel) {
+        // Close the banner before changing screens/states
+        NotificationRenderer::pauseBanner = true;
+        NotificationRenderer::alertBannerUntil = 1;
+
+        switch (sel) {
+        case kPreset:
+            if (cannedMessageModule)
+                cannedMessageModule->LaunchWithDestination(nodeId);
+            break;
+
+        case kFree:
+            if (cannedMessageModule)
+                cannedMessageModule->LaunchFreetextWithDestination(nodeId);
+            break;
+
+        case kEmote:
+            if (cannedMessageModule)
+                cannedMessageModule->LaunchEmoteWithDestination(nodeId);
+            break;
+
+        case kRemove:
+            // Remove chat history only (RAM + persistent)
+            chat::ChatHistoryStore::instance().clearDM(nodeId);
+            // Also remove persistent file
+            {
+                std::string filename = "/chat_dm_" + std::to_string(nodeId) + ".txt";
+                FSCom.remove(filename.c_str());
+            }
+            // Close message carousel since conversation is removed
+            if (cannedMessageModule)
+                cannedMessageModule->closeMessageCarousel();
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            break;
+
+        case kRemoveFav:
+            if (nodeDB)
+                nodeDB->set_favorite(false, nodeId);
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            break;
+
+        case kDeleteNode:
+            // Completely remove the node from the database
+            if (nodeDB) {
+                nodeDB->removeNodeByNum(nodeId);
+                // Also remove chat history
+                chat::ChatHistoryStore::instance().clearDM(nodeId);
+                // Also remove persistent chat file
+                std::string filename = "/chat_dm_" + std::to_string(nodeId) + ".txt";
+                FSCom.remove(filename.c_str());
+                if (screen)
+                    screen->showSimpleBanner("Node deleted", 1200);
+            }
+            // Close message carousel since node is deleted
+            if (cannedMessageModule)
+                cannedMessageModule->closeMessageCarousel();
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            break;
+
+        case kMarkRead:
+            // Mark all DM messages as read
+            chat::ChatHistoryStore::instance().markAsReadDM(nodeId);
+            // Reset scroll to newest message
+            if (g_nodeScroll.find(nodeId) != g_nodeScroll.end()) {
+                g_nodeScroll[nodeId].scrollIndex = 0;
+                g_nodeScroll[nodeId].sel = 0;
+            }
+            if (screen)
+                screen->showSimpleBanner("All marked as read", 1200);
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            break;
+
+        case kInfo:
+            if (screen) {
+                graphics::UIRenderer::currentFavoriteNodeNum = nodeId;
+                screen->openNodeInfoFor(nodeId);
+            }
+            break;
+
+        case kScrollType:
+            g_chatScrollUpDown = !g_chatScrollUpDown;
+            if (screen)
+                screen->showSimpleBanner(g_chatScrollUpDown ? "Scroll Dir: LEFT" : "Scroll Dir: RIGHT", 1200);
+            break;
+
+        case kBack:
+            // Just close the menu and return to chat carousel
+            break;
+
+        case kExit:
+            // Close chat carousel properly using CannedMessageModule
+            if (cannedMessageModule) {
+                cannedMessageModule->closeMessageCarousel();
+            } else {
+                // Fallback if cannedMessageModule is not available
+                if (screen)
+                    screen->setFrames(Screen::FOCUS_DEFAULT);
+            }
+            break;
+
+        default:
+            break;
+        }
+
+        if (screen)
+            screen->forceDisplay(true);
+    };
+
+    screen->showOverlayBanner(o);
+#else
+    // Simplified version for memory-constrained devices - just show message sending options
+    if (cannedMessageModule) {
+        cannedMessageModule->LaunchWithDestination(nodeId);
+    }
+#endif // !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+}
+
+void menuHandler::openChatActionsForChannel(uint8_t ch)
+{
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+    enum { kPreset = 1, kFree = 2, kEmote = 3, kRemove = 4, kMarkRead = 5, kScrollType = 6, kBack = 7, kExit = 8 };
+
+    static const char *opts[8];
+    static int enums[8];
+    int count = 0;
+
+    // Preset / Freetext according to CardKB
+    if (kb_found) {
+        opts[count] = "New Freetext Msg";
+        enums[count] = kFree;
+        count++;
+    } else {
+        opts[count] = "New Preset Msg";
+        enums[count] = kPreset;
+        count++;
+    }
+
+    // Always add emote option
+    opts[count] = "New Emote Msg";
+    enums[count] = kEmote;
+    count++;
+
+    // Common
+    opts[count] = "Remove Chat";
+    enums[count] = kRemove;
+    count++;
+
+    opts[count] = "Mark All Read";
+    enums[count] = kMarkRead;
+    count++;
+
+    // Scroll is always enabled, only show direction option if no CardKB and no rotary encoder
+    static char scrollTypeLabel[24];
+    if (!kb_found && rotaryEncoderInterruptImpl1 == nullptr) {
+        snprintf(scrollTypeLabel, sizeof(scrollTypeLabel), "Scroll Dir: %s", g_chatScrollUpDown ? "LEFT" : "RIGHT");
+        opts[count] = scrollTypeLabel;
+        enums[count] = kScrollType;
+        count++;
+    }
+
+    opts[count] = "Back";
+    enums[count] = kBack;
+    count++;
+
+    opts[count] = "Exit";
+    enums[count] = kExit;
+    count++;
+
+    // Title with channel name (if exists)
+    const meshtastic_Channel c = channels.getByIndex(ch);
+    const char *cname = (c.settings.name[0]) ? c.settings.name : nullptr;
+    char title[64];
+    if (cname)
+        snprintf(title, sizeof(title), "Channel: %s", cname);
+    else
+        snprintf(title, sizeof(title), "Channel %u", (unsigned)ch);
+
+    BannerOverlayOptions o;
+    o.message = "Chat Actions";
+    o.durationMs = 0;
+    o.optionsArrayPtr = opts;
+    o.optionsEnumPtr = enums;
+    o.optionsCount = count;
+
+    o.bannerCallback = [ch](int sel) {
+        // Close banner before acting (avoids weird states)
+        NotificationRenderer::pauseBanner = true;
+        NotificationRenderer::alertBannerUntil = 1;
+
+        // Prepare keyboard header (if input is opened later)
+        const meshtastic_Channel cc = channels.getByIndex(ch);
+        const char *cname2 = (cc.settings.name[0]) ? cc.settings.name : nullptr;
+        char hdr[64];
+        if (cname2)
+            snprintf(hdr, sizeof(hdr), "To: %s", cname2);
+        else
+            snprintf(hdr, sizeof(hdr), "To: Channel %u", (unsigned)ch);
+        g_pendingKeyboardHeader = hdr;
+
+        // Ensure channel is active and marked as favorite-tab
+        channels.setActiveByIndex(ch);
+        g_favChannelTabs.insert(ch);
+
+        switch (sel) {
+        case kPreset:
+            if (cannedMessageModule)
+                cannedMessageModule->LaunchWithDestination(NODENUM_BROADCAST, ch);
+            break;
+        case kFree:
+            if (cannedMessageModule)
+                cannedMessageModule->LaunchFreetextWithDestination(NODENUM_BROADCAST, ch);
+            break;
+        case kEmote:
+            if (cannedMessageModule)
+                cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST, ch);
+            break;
+        case kRemove:
+            // Remove chat history but maintain channel and frame (RAM + persistent)
+            chat::ChatHistoryStore::instance().clearCHAN(ch);
+            // Also remove persistent file
+            {
+                std::string filename = "/prefs/chat_ch_" + std::to_string(ch) + ".csv";
+                FSCom.remove(filename.c_str());
+            }
+            // Close message carousel since conversation is removed
+            if (cannedMessageModule)
+                cannedMessageModule->closeMessageCarousel();
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            break;
+        case kMarkRead:
+            // Mark all channel messages as read
+            chat::ChatHistoryStore::instance().markAsReadCHAN(ch);
+            // Reset scroll to newest message
+            if (g_chanScroll.find(ch) != g_chanScroll.end()) {
+                g_chanScroll[ch].scrollIndex = 0;
+                g_chanScroll[ch].sel = 0;
+            }
+            if (screen)
+                screen->showSimpleBanner("All marked as read", 1200);
+            if (screen)
+                screen->setFrames(Screen::FOCUS_PRESERVE);
+            break;
+        case kScrollType:
+            g_chatScrollUpDown = !g_chatScrollUpDown;
+            if (screen)
+                screen->showSimpleBanner(g_chatScrollUpDown ? "Scroll Dir: LEFT" : "Scroll Dir: RIGHT", 1200);
+            break;
+        case kBack:
+            // Just close the menu and return to chat carousel
+            break;
+
+        case kExit:
+            // Close chat carousel properly using CannedMessageModule
+            if (cannedMessageModule) {
+                cannedMessageModule->closeMessageCarousel();
+            } else {
+                // Fallback if cannedMessageModule is not available
+                if (screen)
+                    screen->setFrames(Screen::FOCUS_DEFAULT);
+            }
+            break;
+        default:
+            break;
+        }
+
+        if (screen)
+            screen->forceDisplay(true);
+    };
+
+    screen->showOverlayBanner(o);
+#else
+    // Simplified version for memory-constrained devices - just show message sending options
+    if (cannedMessageModule) {
+        cannedMessageModule->LaunchWithDestination(NODENUM_BROADCAST, ch);
+    }
+#endif // !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+}
+
+} // namespace graphics

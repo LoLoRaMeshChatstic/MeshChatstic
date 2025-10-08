@@ -33,7 +33,10 @@ class menuHandler
         remove_favorite,
         test_menu,
         number_test,
+#if HAS_WIFI
         wifi_toggle_menu,
+        wifi_scan_menu,
+#endif
         bluetooth_toggle_menu,
         notifications_menu,
         screen_options_menu,
@@ -43,7 +46,22 @@ class menuHandler
         key_verification_final_prompt,
         trace_route_menu,
         throttle_message,
-        FrameToggles
+        FrameToggles,
+#if HAS_WIFI
+        wifi_config_menu,
+        wifi_base_menu,
+        wifi_password_prompt,
+        mqtt_base_menu,
+        mqtt_toggle_menu,
+        mqtt_server_config,
+        mqtt_credentials_config,
+        mqtt_server_prompt,
+        mqtt_username_prompt,
+        mqtt_password_prompt,
+        mqtt_root_prompt,
+#endif
+        sleep_menu,
+        sleep_timer_config
     };
     static screenMenus menuQueue;
 
@@ -82,11 +100,21 @@ class menuHandler
     static void numberTest();
     static void wifiBaseMenu();
     static void wifiToggleMenu();
+    static void wifiScanMenu();
+    static void wifiConfigMenu();
+    static void mqttBaseMenu();
+    static void mqttToggleMenu();
+    static void mqttServerConfig();
+    static void mqttCredentialsConfig();
     static void notificationsMenu();
     static void screenOptionsMenu();
     static void powerMenu();
     static void FrameToggles_menu();
-    static void textMessageMenu();
+    static void silentModeToggle();
+    static void sleepMenu();
+    static void sleepTimerConfig();
+    static void openChatActionsForNode(uint32_t nodeId);
+    static void openChatActionsForChannel(uint8_t ch);
 
   private:
     static void saveUIConfig();
@@ -96,4 +124,4 @@ class menuHandler
 };
 
 } // namespace graphics
-#endif
+#endif // HAS_SCREEN

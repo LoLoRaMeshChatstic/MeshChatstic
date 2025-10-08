@@ -25,7 +25,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "PowerMon.h"
 #include "Throttle.h"
 #include "configuration.h"
-#include "meshUtils.h"
 #if HAS_SCREEN
 #include <OLEDDisplay.h>
 
@@ -39,6 +38,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "draw/NotificationRenderer.h"
 #include "draw/UIRenderer.h"
 #include "modules/CannedMessageModule.h"
+
+// External module references
+#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
+extern CannedMessageModule *cannedMessageModule;
+#endif
+
+#include "modules/ChatHistoryStore.h"
 
 #if !MESHTASTIC_EXCLUDE_GPS
 #include "GPS.h"
@@ -54,22 +60,37 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "graphics/SharedUIDisplay.h"
 #include "graphics/emotes.h"
 #include "graphics/images.h"
+#include "input/RotaryEncoderInterruptImpl1.h"
 #include "input/TouchScreenImpl1.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
 #include "mesh/Channels.h"
+#include "mesh/MeshTypes.h" // for NODENUM_BROADCAST
 #include "mesh/generated/meshtastic/deviceonly.pb.h"
+#include "meshUtils.h"
 #include "modules/ExternalNotificationModule.h"
 #include "modules/TextMessageModule.h"
 #include "modules/WaypointModule.h"
 #include "sleep.h"
 #include "target_specific.h"
 
+#include <algorithm>
+#include <map>
+#include <set>
+#include <vector>
+
 using graphics::Emote;
 using graphics::emotes;
 using graphics::numEmotes;
 
 extern uint16_t TFT_MESH;
+extern bool g_chatScrollByPress; // comes from MenuHandler.cpp
+extern bool g_chatScrollUpDown;  // comes from MenuHandler.cpp
+extern RotaryEncoderInterruptImpl1 *rotaryEncoderInterruptImpl1;
+extern graphics::Screen *screen; // Global screen instance
+
+// Global variable for chat silent mode
+bool g_chatSilentMode = false;
 
 #if HAS_WIFI && !defined(ARCH_PORTDUINO)
 #include "mesh/wifi/WiFiAPClient.h"
@@ -90,11 +111,536 @@ extern uint16_t TFT_MESH;
 
 using namespace meshtastic; /** @todo remove */
 
+// ScrollState definition for chat scrolling
+struct ScrollState {
+    int sel = 0;         // selected line (0..visible-1)
+    int scrollIndex = 0; // first visible message (sliding window)
+    int offset = 0;      // horizontal offset (characters)
+    uint32_t lastMs = 0; // last update
+};
+
+// Global variables for chat functionality
+std::string g_pendingKeyboardHeader;
+std::set<uint8_t> g_favChannelTabs;
+std::map<uint32_t, ScrollState> g_nodeScroll; //  node (DM)
+std::map<uint8_t, ScrollState> g_chanScroll;  //  channel
+
 namespace graphics
 {
 
+// Alias for global ScrollState to avoid conflicts
+using GlobalScrollState = ::ScrollState;
+
 // This means the *visible* area (sh1106 can address 132, but shows 128 for example)
 #define IDLE_FRAMERATE 1 // in fps
+
+// --- return to the same chat after sending text ---
+static int s_returnToFrame = -1;
+static bool s_reFocusAfterSend = false;
+
+// Seed to open channel chat tabs at startup
+static bool s_seededChannelTabs = false;
+static void seedChannelTabsFromConfig();
+
+// --- Helpers to filter options according to CardKB ---
+static uint8_t filterByCardKB(const char *const *srcOptions, const int *srcEnums, uint8_t srcCount, const char **dstOptions,
+                              int *dstEnums)
+{
+    // Rule:
+    //  - With CardKB (kb_found=true): hide "New preset msg"
+    //  - Without CardKB (kb_found=false): hide "New text msg"
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < srcCount; ++i) {
+        const char *s = srcOptions[i];
+        if (!s)
+            continue;
+
+        bool isPreset = (strncmp(s, "New preset msg", 14) == 0);
+        bool isText = (strncmp(s, "New text msg", 12) == 0);
+
+        if (kb_found) {
+            if (isPreset)
+                continue; // hide "New preset msg"
+        } else {
+            if (isText)
+                continue; // hide "New text msg"
+        }
+
+        dstOptions[n] = s;
+        if (srcEnums)
+            dstEnums[n] = srcEnums[i];
+        ++n;
+    }
+    return n;
+}
+
+static void showMenuFilteredByCardKB(const char *title, const char *const *options, const int *enums, uint8_t count,
+                                     std::function<void(int)> cb)
+{
+    // Static buffers to ensure lifetime until the user selects
+    static const char *filteredOpts[20];
+    static int filteredEnums[20];
+
+    uint8_t filteredCount = filterByCardKB(options, enums, count, filteredOpts, filteredEnums);
+
+    // If there are no options left, exit without showing anything
+    if (filteredCount == 0) {
+        return;
+    }
+
+    // Selection banner assembly
+    NotificationRenderer::resetBanner();
+    strlcpy(NotificationRenderer::alertBannerMessage, title, sizeof(NotificationRenderer::alertBannerMessage));
+    NotificationRenderer::curSelected = 0;
+    NotificationRenderer::alertBannerOptions = filteredCount;
+    NotificationRenderer::optionsArrayPtr = filteredOpts;
+    NotificationRenderer::optionsEnumPtr = (enums ? filteredEnums : nullptr);
+    NotificationRenderer::alertBannerCallback = cb;
+    NotificationRenderer::alertBannerUntil = 0;
+    NotificationRenderer::current_notification_type = notificationTypeEnum::selection_picker;
+}
+
+// === Helpers to show age of last message with s/m/h/D ===
+static String ageLabel(uint32_t tsSec)
+{
+    uint32_t nowSec = (uint32_t)time(nullptr);
+    if (nowSec == 0) {
+        nowSec = millis() / 1000;
+    }
+
+    uint32_t diff = (nowSec > tsSec) ? (nowSec - tsSec) : 0;
+
+    if (diff < 60) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%lus", (unsigned long)diff);
+        return String(buf);
+    } else if (diff < 3600) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%lum", (unsigned long)(diff / 60));
+        return String(buf);
+    } else if (diff < 86400) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%luh", (unsigned long)(diff / 3600));
+        return String(buf);
+    } else {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%luD", (unsigned long)(diff / 86400));
+        return String(buf);
+    }
+}
+
+static String currentChatAgeLabel(uint32_t nodeIdOrDest, uint8_t ch)
+{
+    uint32_t ts = 0;
+    bool ok = false;
+
+    if (nodeIdOrDest == NODENUM_BROADCAST) {
+        const auto &v = chat::ChatHistoryStore::instance().getCHAN(ch);
+        if (!v.empty()) {
+            ts = v.back().ts;
+            ok = true;
+        }
+    } else {
+        const auto &v = chat::ChatHistoryStore::instance().getDM(nodeIdOrDest);
+        if (!v.empty()) {
+            ts = v.back().ts;
+            ok = true;
+        }
+    }
+
+    return ok ? ageLabel(ts) : String("");
+}
+
+// ====== Pending header for the keyboard (fix "To:" in channels) ======
+
+// === Chat tabs: state & draw helpers ===
+static std::vector<uint32_t> g_favChatNodes;
+static size_t g_favChatFirst = (size_t)-1;
+static size_t g_favChatLast = (size_t)-1;
+
+static std::vector<uint8_t> g_chanTabs;
+static size_t g_chanTabFirst = (size_t)-1;
+static size_t g_chanTabLast = (size_t)-1;
+
+// Channel "favorites" managed only from Screen.cpp - moved outside namespace
+
+static void seedChannelTabsFromConfig()
+{
+    if (s_seededChannelTabs)
+        return;
+    s_seededChannelTabs = true;
+    int n = channels.getNumChannels();
+    for (int i = 0; i < n; ++i) {
+        const meshtastic_Channel c = channels.getByIndex(i);
+        bool present = (i == 0);
+        if (c.settings.name[0])
+            present = true;
+        if (present)
+            g_favChannelTabs.insert((uint8_t)i);
+    }
+}
+
+// ===== Horizontal scroll only on selected line =====
+static bool g_chatScrollActive = false; // true if any frame drew marquee this cycle
+
+// ==== ScrollState for DM/Channel tracking ====
+
+struct ScrollState {
+    int sel = 0;         // selected line (0..visible-1)
+    int scrollIndex = 0; // first visible message (sliding window)
+    int offset = 0;      // horizontal offset (characters)
+    uint32_t lastMs = 0; // last update
+};
+
+// Marquee auto-scroll control
+static uint32_t g_lastInteractionMs = 0;          // Last user interaction timestamp
+static const uint32_t MARQUEE_TIMEOUT_MS = 30000; // 30 seconds timeout for marquee reset
+// static const uint32_t HOME_TIMEOUT_MS = 50000; // 40 seconds timeout for home return - DISABLED
+static uint8_t g_previousFrame = 0xFF; // Track frame changes for auto-scroll on enter
+
+// Forward declarations
+static void updateLastInteraction();
+
+// Helpers (in case we ever treat channel as a "virtual node")
+static inline bool isVirtualChannelNode(uint32_t nodeId)
+{
+    return (nodeId & 0xC0000000u) == 0xC0000000u;
+}
+static inline uint8_t channelOfVirtual(uint32_t nodeId)
+{
+    return (uint8_t)(nodeId & 0xFFu);
+}
+static inline uint32_t makeVirtualChannelNode(uint8_t ch)
+{
+    return 0xC0000000u | ch;
+}
+
+// Marquee helper: returns window of 'cap' chars, advancing every ~200ms
+static std::string marqueeSlice(const std::string &in, GlobalScrollState &st, int cap, bool advance)
+{
+    if ((int)in.size() <= cap) {
+        st.offset = 0;
+        return in;
+    }
+
+    const uint32_t stepMs = 200;
+    const std::string sep = "   ";
+    if (advance) {
+        uint32_t now = millis();
+        if (now - st.lastMs >= stepMs) {
+            st.lastMs = now;
+            st.offset = st.offset + 1;
+        }
+    }
+
+    std::string padded = in + sep;
+    int n = (int)padded.size();
+    int o = (n > 0) ? (st.offset % n) : 0;
+
+    if (o + cap <= n)
+        return padded.substr(o, cap);
+    std::string s1 = padded.substr(o);
+    return s1 + padded.substr(0, cap - (int)s1.size());
+}
+
+// Marquee auto-scroll functions
+static void updateLastInteraction()
+{
+    g_lastInteractionMs = millis();
+}
+
+void resetScrollToTop(uint32_t nodeId, bool isDM)
+{
+    if (!screen)
+        return; // Use global screen instance
+
+    if (isDM) {
+        GlobalScrollState &st = g_nodeScroll[nodeId];
+        const auto &dmHistory = chat::ChatHistoryStore::instance().getDM(nodeId);
+        int totalMessages = (int)dmHistory.size();
+        if (totalMessages > 0) {
+            // Find the last read message to position there
+            int lastReadIdx = chat::ChatHistoryStore::instance().getLastReadIndexDM(nodeId);
+
+            if (lastReadIdx >= 0) {
+                // Position the last read message on the first line (row 0)
+                // itemIndex = total - 1 - (scrollIndex + row), we want lastReadIdx on row 0
+                // so: lastReadIdx = total - 1 - (scrollIndex + 0) => scrollIndex = total - 1 - lastReadIdx
+                st.scrollIndex = totalMessages - 1 - lastReadIdx;
+                st.sel = 0; // Marquee on the first line (last read)
+            } else {
+                // If no messages are read, go to the newest (first line)
+                st.scrollIndex = 0;
+                st.sel = 0;
+            }
+            st.offset = 0; // Reset horizontal scroll too
+            st.lastMs = millis();
+        }
+    } else {
+        uint8_t ch = (uint8_t)nodeId;
+        GlobalScrollState &st = g_chanScroll[ch];
+        const auto &chanHistory = chat::ChatHistoryStore::instance().getCHAN(ch);
+        int totalMessages = (int)chanHistory.size();
+        if (totalMessages > 0) {
+            // Find the last read message to position there
+            int lastReadIdx = chat::ChatHistoryStore::instance().getLastReadIndexCHAN(ch);
+
+            if (lastReadIdx >= 0) {
+                // Position the last read message on the first line (row 0)
+                // itemIndex = total - 1 - (scrollIndex + row), we want lastReadIdx on row 0
+                // so: lastReadIdx = total - 1 - (scrollIndex + 0) => scrollIndex = total - 1 - lastReadIdx
+                st.scrollIndex = totalMessages - 1 - lastReadIdx;
+                st.sel = 0; // Marquee on the first line (last read)
+            } else {
+                // If no messages are read, go to the newest (first line)
+                st.scrollIndex = 0;
+                st.sel = 0;
+            }
+            st.offset = 0; // Reset horizontal scroll too
+            st.lastMs = millis();
+        }
+    }
+}
+
+void Screen::checkInactivityTimeouts()
+{
+    if (g_lastInteractionMs == 0) {
+        g_lastInteractionMs = millis(); // Initialize on first call
+        return;
+    }
+
+    uint32_t now = millis();
+    uint32_t inactiveTime = now - g_lastInteractionMs;
+
+    // 30 seconds without interaction - reset marquee/scroll position
+    if (inactiveTime >= MARQUEE_TIMEOUT_MS) {
+        if (getUI() && isShowingNormalScreen()) {
+            uint8_t currentFrame = getUI()->getUiState()->currentFrame;
+
+            // Reset scroll positions for current chat if in a chat frame
+            // Check if we're in a DM chat
+            if (g_favChatFirst != (size_t)-1 && currentFrame >= g_favChatFirst && currentFrame <= g_favChatLast) {
+                size_t index = currentFrame - g_favChatFirst;
+                if (index < g_favChatNodes.size()) {
+                    uint32_t nodeId = g_favChatNodes[index];
+                    resetScrollToTop(nodeId, true);
+                    LOG_DEBUG("Marquee timeout: reset DM scroll for node %08x", nodeId);
+                }
+            }
+            // Check if we're in a channel chat
+            else if (g_chanTabFirst != (size_t)-1 && currentFrame >= g_chanTabFirst && currentFrame <= g_chanTabLast) {
+                size_t index = currentFrame - g_chanTabFirst;
+                if (index < g_chanTabs.size()) {
+                    uint8_t ch = g_chanTabs[index];
+                    resetScrollToTop(ch, false);
+                    LOG_DEBUG("Marquee timeout: reset channel scroll for ch %d", ch);
+                }
+            }
+        }
+    }
+
+    // 40 seconds without interaction - return to home frame and reset scroll
+    // DISABLED: This timeout causes issues with message carousel navigation
+    /*
+    if (inactiveTime >= HOME_TIMEOUT_MS) {
+        if (getUI() && isShowingNormalScreen()) {
+            uint8_t currentFrame = getUI()->getUiState()->currentFrame;
+
+            // If not on home frame (frame 0), go to home
+            if (currentFrame != 0) {
+                LOG_DEBUG("Home timeout: returning to home frame from frame %d", currentFrame);
+                getUI()->switchToFrame(0);
+                forceDisplay();
+            }
+
+            // Reset scroll positions for current chat if in a chat frame
+            // Check if we're in a DM chat
+            if (g_favChatFirst != (size_t)-1 && currentFrame >= g_favChatFirst && currentFrame <= g_favChatLast) {
+                size_t index = currentFrame - g_favChatFirst;
+                if (index < g_favChatNodes.size()) {
+                    uint32_t nodeId = g_favChatNodes[index];
+                    resetScrollToTop(nodeId, true);
+                    LOG_DEBUG("Home timeout: reset DM scroll for node %08x", nodeId);
+                }
+            }
+            // Check if we're in a channel chat
+            else if (g_chanTabFirst != (size_t)-1 && currentFrame >= g_chanTabFirst && currentFrame <= g_chanTabLast) {
+                size_t index = currentFrame - g_chanTabFirst;
+                if (index < g_chanTabs.size()) {
+                    uint8_t ch = g_chanTabs[index];
+                    resetScrollToTop(ch, false);
+                    LOG_DEBUG("Home timeout: reset channel scroll for ch %d", ch);
+                }
+            }
+        }
+        g_lastInteractionMs = now; // Reset timer only after going home
+    }
+    */
+}
+
+void checkFrameChange()
+{
+    if (!screen || !screen->getUI() || !screen->isShowingNormalScreen())
+        return;
+
+    uint8_t currentFrame = screen->getUI()->getUiState()->currentFrame;
+
+    // Check if frame has changed
+    if (g_previousFrame != 0xFF && g_previousFrame != currentFrame) {
+        // Frame changed - check if we entered a chat frame
+        bool enteredChat = false;
+
+        // Check if we entered a DM chat
+        if (g_favChatFirst != (size_t)-1 && currentFrame >= g_favChatFirst && currentFrame <= g_favChatLast) {
+            size_t index = currentFrame - g_favChatFirst;
+            if (index < g_favChatNodes.size()) {
+                uint32_t nodeId = g_favChatNodes[index];
+                resetScrollToTop(nodeId, true);
+                LOG_DEBUG("Frame change: reset DM scroll for node %08x (frame %d->%d)", nodeId, g_previousFrame, currentFrame);
+                enteredChat = true;
+            }
+        }
+        // Check if we entered a channel chat
+        else if (g_chanTabFirst != (size_t)-1 && currentFrame >= g_chanTabFirst && currentFrame <= g_chanTabLast) {
+            size_t index = currentFrame - g_chanTabFirst;
+            if (index < g_chanTabs.size()) {
+                uint8_t ch = g_chanTabs[index];
+                resetScrollToTop(ch, false);
+                LOG_DEBUG("Frame change: reset channel scroll for ch %d (frame %d->%d)", ch, g_previousFrame, currentFrame);
+                enteredChat = true;
+            }
+        }
+
+        if (enteredChat) {
+            updateLastInteraction(); // Reset timeout when entering chat
+        }
+    }
+
+    g_previousFrame = currentFrame;
+}
+
+// Small text line helper
+static void drawLineSmall(OLEDDisplay *display, int16_t x, int16_t y, const char *s)
+{
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    display->setFont(FONT_SMALL);
+    display->drawString(x, y, s);
+}
+
+// Function to detect if a message needs extra height (emotes or line breaks)
+static bool needsExtraHeight(const std::string &text)
+{
+    // Check for multiple newlines (count them)
+    size_t newlineCount = 0;
+    size_t pos = 0;
+    while ((pos = text.find('\n', pos)) != std::string::npos) {
+        newlineCount++;
+        pos++;
+    }
+    if (newlineCount > 0) {
+        return true;
+    }
+
+    // Check for emotes
+    for (int i = 0; i < numEmotes; ++i) {
+        if (text.find(emotes[i].label) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Function to draw with large emotes when needed, preserving marquee for name part
+static void drawLineWithEmotes(OLEDDisplay *display, int16_t x, int16_t y, const char *s)
+{
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    display->setFont(FONT_SMALL);
+
+    std::string text(s);
+    graphics::MessageRenderer::drawStringWithEmotes(display, x, y, text, emotes, numEmotes);
+}
+
+// Public wrapper for modules to access emote rendering
+void graphics::Screen::drawLineWithEmotes(OLEDDisplay *display, int16_t x, int16_t y, const char *s)
+{
+    graphics::drawLineWithEmotes(display, x, y, s);
+}
+
+static void drawFavNodeChatFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+    if (g_favChatFirst == (size_t)-1 || g_favChatLast == (size_t)-1)
+        return;
+    uint8_t cf = state->currentFrame;
+    size_t idx = (size_t)cf - g_favChatFirst;
+    if (idx >= g_favChatNodes.size())
+        return;
+
+    uint32_t nodeId = g_favChatNodes[idx];
+    using chat::ChatHistoryStore;
+    auto &store = ChatHistoryStore::instance();
+    const auto &q = store.getDM(nodeId);
+
+    const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
+
+    // Use 4-digit alias for compact display
+    String alias;
+    if (node && node->has_user && node->user.short_name[0]) {
+        alias = String(node->user.short_name);
+    } else {
+        char buf[5];
+        snprintf(buf, sizeof(buf), "%04X", (unsigned)(nodeId & 0xFFFF));
+        alias = String(buf);
+    }
+
+    // Get unread count
+    int unreadCount = store.getUnreadCountDM(nodeId);
+    String title = alias;
+    if (unreadCount > 0) {
+        title += " (" + String(unreadCount) + ")";
+    }
+
+    // Use MessageRenderer for better quality display
+    graphics::MessageRenderer::drawChatMessageFrame(display, state, x, y, std::string(title.c_str()),
+                                                    q.empty() ? std::string("") : q[q.size() - 1].text,
+                                                    std::string(alias.c_str()), q.empty() ? 0 : q[q.size() - 1].ts);
+}
+
+static void drawChannelChatTabFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+    if (g_chanTabFirst == (size_t)-1 || g_chanTabLast == (size_t)-1)
+        return;
+    uint8_t cf = state->currentFrame;
+    size_t idx = (size_t)cf - g_chanTabFirst;
+    if (idx >= g_chanTabs.size())
+        return;
+
+    uint8_t ch = g_chanTabs[idx];
+    using chat::ChatHistoryStore;
+    auto &store = ChatHistoryStore::instance();
+    const auto &q = store.getCHAN(ch);
+
+    const char *cname = channels.getName(ch);
+
+    // Get unread count
+    int unreadCount = store.getUnreadCountCHAN(ch);
+    String title;
+    if (cname)
+        title = "@" + String(cname);
+    else
+        title = "@Ch" + String(ch);
+
+    if (unreadCount > 0) {
+        title += " (" + String(unreadCount) + ")";
+    }
+
+    // Use MessageRenderer for better quality display
+    graphics::MessageRenderer::drawChatMessageFrame(
+        display, state, x, y, std::string(title.c_str()), q.empty() ? std::string("") : q[q.size() - 1].text,
+        cname ? std::string(cname) : std::string("Ch" + std::to_string(ch)), q.empty() ? 0 : q[q.size() - 1].ts);
+}
+
+// Visible area
+#define IDLE_FRAMERATE 1 // fps
 
 // DEBUG
 #define NUM_EXTRA_FRAMES 3 // text message and debug frame
@@ -141,6 +687,20 @@ extern bool hasUnreadMessage;
 // ==============================
 // Displays a temporary centered banner message (e.g., warning, status, etc.)
 // The banner appears in the center of the screen and disappears after the specified duration
+
+void Screen::openNodeInfoFor(NodeNum nodeNum)
+{
+    // Save which node should be shown
+    graphics::UIRenderer::currentFavoriteNodeNum = nodeNum;
+
+    // Create a FrameCallback with the drawNodeInfoDirect function
+    setFrameImmediateDraw(new FrameCallback([](OLEDDisplay *d, OLEDDisplayUiState *s, int16_t x, int16_t y) {
+        graphics::UIRenderer::drawNodeInfoDirect(d, s, x, y);
+    }));
+}
+
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+#endif
 
 void Screen::showSimpleBanner(const char *message, uint32_t durationMs)
 {
@@ -226,6 +786,12 @@ void Screen::showTextInput(const char *header, const char *initialText, uint32_t
 {
     LOG_INFO("showTextInput called with header='%s', durationMs=%d", header ? header : "NULL", durationMs);
 
+    // Remember current frame to return after sending
+    if (ui && ui->getUiState()) {
+        s_returnToFrame = ui->getUiState()->currentFrame;
+        s_reFocusAfterSend = true;
+    }
+
     if (NotificationRenderer::virtualKeyboard) {
         delete NotificationRenderer::virtualKeyboard;
         NotificationRenderer::virtualKeyboard = nullptr;
@@ -241,11 +807,46 @@ void Screen::showTextInput(const char *header, const char *initialText, uint32_t
         NotificationRenderer::virtualKeyboard->setInputText(initialText);
     }
 
-    // Set up callback with safer cleanup mechanism
-    NotificationRenderer::textInputCallback = textCallback;
-    NotificationRenderer::virtualKeyboard->setCallback([textCallback](const std::string &text) { textCallback(text); });
+    // === Apply pending header here (last) ===
+    if (!g_pendingKeyboardHeader.empty()) {
+        std::string hdr = g_pendingKeyboardHeader;
 
-    // Store the message and set the expiration timestamp (use same pattern as other notifications)
+        // limit of 11 to not overlap with "xxxleft"
+        const int cap = 11;
+
+        if ((int)hdr.size() > cap) {
+            static GlobalScrollState g_headerScroll;
+            std::string view = marqueeSlice(hdr, g_headerScroll, cap, true);
+            NotificationRenderer::virtualKeyboard->setHeader(view.c_str());
+
+            //  keep the header so it continues scrolling
+            g_chatScrollActive = true;
+        } else {
+            NotificationRenderer::virtualKeyboard->setHeader(hdr.c_str());
+            // only clear if it's short, no longer needed
+            g_pendingKeyboardHeader.clear();
+        }
+    }
+
+    // Envolver el envío para volver al chat y evitar salto a “home”
+    auto wrappedSend = [this, textCallback](const std::string &text) {
+        // 1) send (done by the original callback)
+        textCallback(text);
+
+        // 2) immediately return to the chat frame we had
+        if (s_returnToFrame >= 0) {
+            ui->switchToFrame((uint8_t)s_returnToFrame);
+            setFastFramerate();
+            forceDisplay(true);
+
+            // 3) mark refocus in case another setFrames occurs later
+            s_reFocusAfterSend = true;
+        }
+    };
+
+    NotificationRenderer::textInputCallback = wrappedSend;
+    NotificationRenderer::virtualKeyboard->setCallback(wrappedSend);
+
     strncpy(NotificationRenderer::alertBannerMessage, header ? header : "Text Input", 255);
     NotificationRenderer::alertBannerMessage[255] = '\0';
     NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : millis() + durationMs;
@@ -279,6 +880,56 @@ static void drawModuleFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int
     // LOG_DEBUG("Draw Module Frame %d", module_frame);
     MeshModule &pi = *moduleFrames.at(module_frame);
     pi.drawFrame(display, state, x, y);
+}
+
+// === NEW MESSAGE BANNER FUNCTION ===
+// Shows a WhatsApp-style notification banner instead of auto-jumping to chat
+void Screen::showNewMessageBanner(const meshtastic_MeshPacket *packet)
+{
+    if (!packet)
+        return;
+
+    // Determine message source name
+    std::string sourceName;
+    const bool isDirect = (nodeDB && packet->to == nodeDB->getNodeNum());
+
+    if (isDirect) {
+        // DM: Show sender's name
+        const meshtastic_NodeInfoLite *cn = nodeDB->getMeshNode(packet->from);
+        if (cn && cn->has_user && cn->user.short_name[0]) {
+            sourceName = cn->user.short_name;
+        } else {
+            char nodeHex[16];
+            snprintf(nodeHex, sizeof(nodeHex), "!%08x", packet->from);
+            sourceName = nodeHex;
+        }
+    } else {
+        // Channel: Show channel name
+        const char *channelName = channels.getName(packet->channel);
+        if (channelName && channelName[0]) {
+            sourceName = channelName;
+        } else {
+            char channelHex[16];
+            snprintf(channelHex, sizeof(channelHex), "Ch #%d", packet->channel);
+            sourceName = channelHex;
+        }
+    }
+
+    // Create banner message: "new msg 'sourceName'"
+    static char bannerMsg[128];
+    snprintf(bannerMsg, sizeof(bannerMsg), "new msg '%s'", sourceName.c_str());
+
+    // Configure banner options for 5-second display
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = bannerMsg;
+    bannerOptions.durationMs = 5000;         // 5 seconds as requested
+    bannerOptions.optionsArrayPtr = nullptr; // No options = simple banner
+    bannerOptions.optionsCount = 0;
+    bannerOptions.bannerCallback = nullptr;
+    bannerOptions.notificationType = notificationTypeEnum::text_banner;
+
+    // Show the banner
+    showOverlayBanner(bannerOptions);
 }
 
 // Ignore messages originating from phone (from the current node 0x0) unless range test or store and forward module are enabled
@@ -328,6 +979,7 @@ static int8_t prevFrame = -1;
 SPIClass SPI1(HSPI);
 #endif
 
+#if HAS_SCREEN
 Screen::Screen(ScanI2C::DeviceAddress address, meshtastic_Config_DisplayConfig_OledType screenType, OLEDDISPLAY_GEOMETRY geometry)
     : concurrency::OSThread("Screen"), address_found(address), model(screenType), geometry(geometry), cmdQueue(32)
 {
@@ -660,19 +1312,6 @@ void Screen::setup()
     MeshModule::observeUIEvents(&uiFrameEventObserver);
 }
 
-void Screen::setOn(bool on, FrameCallback einkScreensaver)
-{
-#if defined(T_LORA_PAGER)
-    if (cardKbI2cImpl)
-        cardKbI2cImpl->toggleBacklight(on);
-#endif
-    if (!on)
-        // We handle off commands immediately, because they might be called because the CPU is shutting down
-        handleSetOn(false, einkScreensaver);
-    else
-        enqueueCmd(ScreenCmd{.cmd = Cmd::SET_ON});
-}
-
 void Screen::forceDisplay(bool forceUiUpdate)
 {
     // Nasty hack to force epaper updates for 'key' frames.  FIXME, cleanup.
@@ -836,16 +1475,23 @@ int32_t Screen::runOnce()
     // want to draw at least one FIXED frame before doing forceDisplay
     ui->update();
 
-    // Switch to a low framerate (to save CPU) when we are not in transition
-    // but we should only call setTargetFPS when framestate changes, because
-    // otherwise that breaks animations.
+    // Manage FPS depending on whether marquee is active or not
+    if (ui->getUiState()->frameState == FIXED) {
+        // Check for frame changes to reset scroll when entering chat
+        checkFrameChange();
 
-    if (targetFramerate != IDLE_FRAMERATE && ui->getUiState()->frameState == FIXED) {
-        // oldFrameState = ui->getUiState()->frameState;
-        targetFramerate = IDLE_FRAMERATE;
+        // Check for inactivity timeouts (40s home return, 60s screen off)
+        // checkInactivityTimeouts(); // DISABLED: Causes issues with message carousel
 
-        ui->setTargetFPS(targetFramerate);
-        forceDisplay();
+        if (g_chatScrollActive) {
+            if (targetFramerate == IDLE_FRAMERATE) {
+                setFastFramerate();
+            }
+        } else if (targetFramerate != IDLE_FRAMERATE) {
+            targetFramerate = IDLE_FRAMERATE;
+            ui->setTargetFPS(targetFramerate);
+            forceDisplay();
+        }
     }
 
     // While showing the bootscreen or Bluetooth pair screen all of our
@@ -983,18 +1629,11 @@ void Screen::setFrames(FrameFocus focus)
     }
 #endif
 
-    // Declare this early so it’s available in FOCUS_PRESERVE block
-    bool willInsertTextMessage = shouldDrawMessage(&devicestate.rx_text_message);
-
     if (!hiddenFrames.home) {
         fsi.positions.home = numframes;
         normalFrames[numframes++] = graphics::UIRenderer::drawDeviceFocused;
         indicatorIcons.push_back(icon_home);
     }
-
-    fsi.positions.textMessage = numframes;
-    normalFrames[numframes++] = graphics::MessageRenderer::drawTextMessageFrame;
-    indicatorIcons.push_back(icon_mail);
 
 #ifndef USE_EINK
     if (!hiddenFrames.nodelist) {
@@ -1058,13 +1697,7 @@ void Screen::setFrames(FrameFocus focus)
         indicatorIcons.push_back(chirpy_small);
     }
 
-#if HAS_WIFI && !defined(ARCH_PORTDUINO)
-    if (!hiddenFrames.wifi && isWifiAvailable()) {
-        fsi.positions.wifi = numframes;
-        normalFrames[numframes++] = graphics::DebugRenderer::drawDebugInfoWiFiTrampoline;
-        indicatorIcons.push_back(icon_wifi);
-    }
-#endif
+    // WiFi frame removed from carousel - access via WiFi Config menu only
 
     // Beware of what changes you make in this code!
     // We pass numframes into GetMeshModulesWithUIFrames() which is highly important!
@@ -1095,39 +1728,60 @@ void Screen::setFrames(FrameFocus focus)
     }
 
     LOG_DEBUG("Added modules.  numframes: %d", numframes);
+    // --- seed channel tabs at startup ---
+    // This ensures that favorite channels are available as tabs when the UI loads.
+    seedChannelTabsFromConfig();
 
-    // We don't show the node info of our node (if we have it yet - we should)
-    size_t numMeshNodes = nodeDB->getNumMeshNodes();
-    if (numMeshNodes > 0)
-        numMeshNodes--;
-
-    if (!hiddenFrames.show_favorites) {
-        // Temporary array to hold favorite node frames
-        std::vector<FrameCallback> favoriteFrames;
-
+    // ===== Chat tabs by node (favorites) =====
+    {
+        graphics::g_favChatNodes.clear();
         for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
             const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
             if (n && n->num != nodeDB->getNodeNum() && n->is_favorite) {
-                favoriteFrames.push_back(graphics::UIRenderer::drawNodeInfo);
+                graphics::g_favChatNodes.push_back(n->num);
             }
         }
-
-        // Insert favorite frames *after* collecting them all
-        if (!favoriteFrames.empty()) {
-            fsi.positions.firstFavorite = numframes;
-            for (const auto &f : favoriteFrames) {
-                normalFrames[numframes++] = f;
-                indicatorIcons.push_back(icon_node);
+        if (!graphics::g_favChatNodes.empty()) {
+            graphics::g_favChatFirst = numframes;
+            for (size_t i = 0; i < graphics::g_favChatNodes.size(); ++i) {
+                normalFrames[numframes++] = graphics::drawFavNodeChatFrame;
+                indicatorIcons.push_back(icon_mail);
             }
-            fsi.positions.lastFavorite = numframes - 1;
+            graphics::g_favChatLast = numframes - 1;
         } else {
-            fsi.positions.firstFavorite = 255;
-            fsi.positions.lastFavorite = 255;
+            graphics::g_favChatFirst = graphics::g_favChatLast = (size_t)-1;
+        }
+    }
+
+    // ===== Chat tabs by channel =====
+    {
+        using chat::ChatHistoryStore;
+        auto &store = ChatHistoryStore::instance();
+
+        // Merge channel history with favorites managed here
+        // This ensures that both recently used and favorite channels appear as tabs
+        std::set<uint8_t> combined;
+        std::vector<uint8_t> fromHistory = store.listChannels();
+        combined.insert(fromHistory.begin(), fromHistory.end());
+        combined.insert(g_favChannelTabs.begin(), g_favChannelTabs.end());
+
+        graphics::g_chanTabs.assign(combined.begin(), combined.end());
+
+        if (!graphics::g_chanTabs.empty()) {
+            graphics::g_chanTabFirst = numframes;
+            for (size_t i = 0; i < graphics::g_chanTabs.size(); ++i) {
+                normalFrames[numframes++] = graphics::drawChannelChatTabFrame;
+                indicatorIcons.push_back(icon_mail);
+            }
+            graphics::g_chanTabLast = numframes - 1;
+        } else {
+            graphics::g_chanTabFirst = graphics::g_chanTabLast = (size_t)-1;
         }
     }
 
     fsi.frameCount = numframes;   // Total framecount is used to apply FOCUS_PRESERVE
     this->frameCount = numframes; // ✅ Save frame count for use in custom overlay
+
     LOG_DEBUG("Finished build frames. numframes: %d", numframes);
 
     ui->setFrames(normalFrames, numframes);
@@ -1179,6 +1833,13 @@ void Screen::setFrames(FrameFocus focus)
 
     // Store the info about this frameset, for future setFrames calls
     this->framesetInfo = fsi;
+
+    if (s_reFocusAfterSend && s_returnToFrame >= 0) {
+        uint8_t target = (uint8_t)std::min<int>(s_returnToFrame, (int)frameCount - 1);
+        ui->switchToFrame(target);
+        s_reFocusAfterSend = false;
+        s_returnToFrame = -1;
+    }
 
     setFastFramerate(); // Draw ASAP
 }
@@ -1273,6 +1934,8 @@ void Screen::hideCurrentFrame()
         LOG_INFO("Hide Text Message");
         devicestate.has_rx_text_message = false;
         memset(&devicestate.rx_text_message, 0, sizeof(devicestate.rx_text_message));
+        hiddenFrames.textMessage = true;
+        dismissed = true;
     } else if (currentFrame == framesetInfo.positions.waypoint && devicestate.has_rx_waypoint) {
         LOG_DEBUG("Hide Waypoint");
         devicestate.has_rx_waypoint = false;
@@ -1317,8 +1980,7 @@ void Screen::blink()
         delay(50);
         count = count - 1;
     }
-    // The dispdev->setBrightness does not work for t-deck display, it seems to run the setBrightness function in
-    // OLEDDisplay.
+    // The dispdev->setBrightness does not work for t-deck display, it seems to run the setBrightness function in OLEDDisplay.
     dispdev->setBrightness(brightness);
 }
 
@@ -1446,38 +2108,141 @@ int Screen::handleTextMessage(const meshtastic_MeshPacket *packet)
 
             setFrames(FOCUS_PRESERVE); // Stay on same frame, silently update frame list
         } else {
-            // Incoming message
-            devicestate.has_rx_text_message = true; // Needed to include the message frame
-            hasUnreadMessage = true;                // Enables mail icon in the header
-            setFrames(FOCUS_PRESERVE);              // Refresh frame list without switching view
-
-            // Only wake/force display if the configuration allows it
-            if (shouldWakeOnReceivedMessage()) {
-                setOn(true);    // Wake up the screen first
-                forceDisplay(); // Forces screen redraw
+            // === FAVORITES: only in DM (destination = my NodeNum) ===
+            // If the message is direct, mark the sender as favorite for quick access in chat tabs
+            const bool isDirect = (nodeDB && packet->to == nodeDB->getNodeNum());
+            if (isDirect) {
+                const uint32_t fromId = packet->from;
+                if (nodeDB && fromId != nodeDB->getNodeNum()) {
+                    const meshtastic_NodeInfoLite *cn = nodeDB->getMeshNode(fromId);
+                    bool isFav = (cn && cn->is_favorite);
+                    if (!isFav) {
+                        nodeDB->set_favorite(fromId, true);
+                        if (cn) {
+                            const_cast<meshtastic_NodeInfoLite *>(cn)->is_favorite = true;
+                        }
+                    }
+                }
+            } else {
+                // Channel message: optionally mark the channel as internal favorite
+                uint8_t ch = (uint8_t)packet->channel;
+                g_favChannelTabs.insert(ch);
             }
-            // === Prepare banner content ===
-            const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(packet->from);
+
+            // Get channel for mute checking (upstream feature)
             const meshtastic_Channel channel =
                 channels.getByIndex(packet->channel ? packet->channel : channels.getPrimaryIndex());
+
+            // Estado y refresco
+            devicestate.has_rx_text_message = true;
+            hasUnreadMessage = true;
+            setFrames(FOCUS_PRESERVE);
+
+            if (shouldWakeOnReceivedMessage())
+                setOn(true);
+
+            // === PREPARE BANNER CONTENT (upstream feature) ===
+            const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(packet->from);
             const char *longName = (node && node->has_user) ? node->user.long_name : nullptr;
-
             const char *msgRaw = reinterpret_cast<const char *>(packet->decoded.payload.bytes);
-
             char banner[256];
 
+            // Check for bell character in message to determine alert type (upstream feature)
             bool isAlert = false;
-
             if (moduleConfig.external_notification.alert_bell || moduleConfig.external_notification.alert_bell_vibra ||
-                moduleConfig.external_notification.alert_bell_buzzer)
+                moduleConfig.external_notification.alert_bell_buzzer) {
                 // Check for bell character to determine if this message is an alert
                 for (size_t i = 0; i < packet->decoded.payload.size && i < 100; i++) {
-                    if (msgRaw[i] == ASCII_BELL) {
+                    if (msgRaw[i] == '\x07') { // ASCII_BELL
                         isAlert = true;
                         break;
                     }
                 }
+            }
 
+            // === SCREEN JUMP ===
+            uint8_t jumpTo = 0xFF;
+            if (isDirect) {
+                if (g_favChatFirst != (size_t)-1) {
+                    auto it = std::find(g_favChatNodes.begin(), g_favChatNodes.end(), packet->from);
+                    if (it != g_favChatNodes.end()) {
+                        jumpTo = (uint8_t)(g_favChatFirst + (it - g_favChatNodes.begin()));
+                    }
+                }
+            } else {
+                if (g_chanTabFirst != (size_t)-1) {
+                    uint8_t ch = (uint8_t)packet->channel;
+                    auto itc = std::find(g_chanTabs.begin(), g_chanTabs.end(), ch);
+                    if (itc != g_chanTabs.end()) {
+                        jumpTo = (uint8_t)(g_chanTabFirst + (itc - g_chanTabs.begin()));
+                    }
+                }
+            }
+
+            // === RESET SCROLL AND UPDATE CURRENT CHAT ===
+            // Always update display if we're currently viewing the chat that received the message
+            // BUT maintain the position at the last read message (don't auto-scroll to newest)
+            uint8_t currentFrame = ui->getUiState()->currentFrame;
+            bool shouldForceRedraw = false;
+
+            if (isDirect) {
+                // Check if we're currently viewing this DM
+                if (g_favChatFirst != (size_t)-1 && currentFrame >= g_favChatFirst && currentFrame <= g_favChatLast) {
+                    auto it = std::find(g_favChatNodes.begin(), g_favChatNodes.end(), packet->from);
+                    if (it != g_favChatNodes.end()) {
+                        uint8_t expectedFrame = (uint8_t)(g_favChatFirst + (it - g_favChatNodes.begin()));
+                        if (currentFrame == expectedFrame) {
+                            // We're viewing this DM - force redraw to show new message
+                            // but DON'T change scroll position (keep at last read message)
+                            shouldForceRedraw = true;
+                        }
+                    }
+                }
+            } else {
+                // Mensaje de canal - check if we're currently viewing this channel
+                uint8_t ch = (uint8_t)packet->channel;
+                if (g_chanTabFirst != (size_t)-1 && currentFrame >= g_chanTabFirst && currentFrame <= g_chanTabLast) {
+                    auto itc = std::find(g_chanTabs.begin(), g_chanTabs.end(), ch);
+                    if (itc != g_chanTabs.end()) {
+                        uint8_t expectedFrame = (uint8_t)(g_chanTabFirst + (itc - g_chanTabs.begin()));
+                        if (currentFrame == expectedFrame) {
+                            // We're viewing this channel - force redraw to show new message
+                            // but DON'T change scroll position (keep at last read message)
+                            shouldForceRedraw = true;
+                        }
+                    }
+                }
+            }
+
+            // === SHOW NEW MESSAGE BANNER INSTEAD OF AUTO-JUMP ===
+            showNewMessageBanner(packet);
+
+            // === UPDATE MESSAGE CAROUSEL IF ACTIVE AND RELEVANT ===
+            // Only update carousel if it's showing the conversation that received the message
+            if (cannedMessageModule) {
+                // Check if carousel is active and showing the relevant conversation
+                bool shouldUpdateCarousel = false;
+
+                if (isDirect) {
+                    // DM message - check if carousel is showing this DM
+                    shouldUpdateCarousel = shouldForceRedraw; // Same logic as main chat view
+                } else {
+                    // Channel message - check if carousel is showing this channel
+                    shouldUpdateCarousel = shouldForceRedraw; // Same logic as main chat view
+                }
+
+                if (shouldUpdateCarousel) {
+                    cannedMessageModule->refreshCarouselIfActive();
+                }
+            }
+
+            // Force redraw if we're viewing the chat that received the message
+            if (shouldForceRedraw) {
+                setFastFramerate();
+                forceDisplay(true); // Forzar actualización UI sin cambiar scroll
+            }
+
+            // === BANNER DISPLAY (combining both approaches) ===
             // Unlike generic messages, alerts (when enabled via the ext notif module) ignore any
             // 'mute' preferences set to any specific node or channel.
             if (isAlert) {
@@ -1494,7 +2259,6 @@ int Screen::handleTextMessage(const meshtastic_MeshPacket *packet)
 #else
                     snprintf(banner, sizeof(banner), "New Message from\n%s", longName);
 #endif
-
                 } else {
                     strcpy(banner, "New Message");
                 }
@@ -1544,8 +2308,40 @@ int Screen::handleUIFrameEvent(const UIFrameEvent *event)
     return 0;
 }
 
+static inline bool isLongPressEvent(int ev)
+{
+    switch (ev) {
+    case INPUT_BROKER_SELECT_LONG:
+        return true;
+#ifdef INPUT_BROKER_USER_LONG
+    case INPUT_BROKER_USER_LONG:
+        return true;
+#endif
+#ifdef INPUT_BROKER_ALT_PRESS_LONG
+    case INPUT_BROKER_ALT_PRESS_LONG:
+        return true;
+#endif
+#ifdef INPUT_BROKER_USER_HOLD
+    case INPUT_BROKER_USER_HOLD:
+        return true;
+#endif
+#ifdef INPUT_BROKER_LONG_PRESS
+    case INPUT_BROKER_LONG_PRESS:
+        return true;
+#endif
+    default:
+        return false;
+    }
+}
+
 int Screen::handleInputEvent(const InputEvent *event)
 {
+    LOG_DEBUG("=== INPUT EVENT === event=%d, kbchar=%d, showingNormal=%d, favNode=%d", event->inputEvent, event->kbchar,
+              showingNormalScreen, graphics::UIRenderer::currentFavoriteNodeNum);
+
+    // Update interaction timestamp for marquee timeout
+    updateLastInteraction();
+
     if (!screenOn)
         return 0;
 
@@ -1576,6 +2372,45 @@ int Screen::handleInputEvent(const InputEvent *event)
         return 0;
     }
 
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    // Handle input when WiFi status screen is showing
+    if (graphics::UIRenderer::showingWifiStatus) {
+        if (event->inputEvent == INPUT_BROKER_BACK || event->inputEvent == INPUT_BROKER_CANCEL ||
+            event->inputEvent == INPUT_BROKER_SELECT) {
+            // Exit WiFi status screen and return to normal frames
+            graphics::UIRenderer::showingWifiStatus = false;
+            setFrames(FOCUS_DEFAULT);
+            return 0;
+        }
+    }
+#endif
+
+    // === DEBUG: NodeInfo Input Handling ===
+    if (graphics::UIRenderer::currentFavoriteNodeNum != 0) {
+        LOG_DEBUG("NodeInfo input - showingNormal=%d, favNode=%d, event=%d, kbchar=%d", showingNormalScreen,
+                  graphics::UIRenderer::currentFavoriteNodeNum, event->inputEvent, event->kbchar);
+
+        // ANY key should close NodeInfo and return to normal frames
+        graphics::UIRenderer::currentFavoriteNodeNum = 0;
+        setFrames(FOCUS_PRESERVE);
+        LOG_DEBUG("NodeInfo closed, returning to normal frames");
+        return 1; // Consumed
+    }
+
+    // === MQTT Status Input Handling ===
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    if (graphics::UIRenderer::showingMqttStatus) {
+        LOG_DEBUG("MQTT Status input - showingNormal=%d, event=%d, kbchar=%d", showingNormalScreen, event->inputEvent,
+                  event->kbchar);
+
+        // ANY key should close MQTT status and return to normal frames
+        graphics::UIRenderer::showingMqttStatus = false;
+        setFrames(FOCUS_PRESERVE);
+        LOG_DEBUG("MQTT Status closed, returning to normal frames");
+        return 1; // Consumed
+    }
+#endif
+
     // Use left or right input from a keyboard to move between frames,
     // so long as a mesh module isn't using these events for some other purpose
     if (showingNormalScreen) {
@@ -1589,24 +2424,257 @@ int Screen::handleInputEvent(const InputEvent *event)
 
         // If no modules are using the input, move between frames
         if (!inputIntercepted) {
+            // === Are we in a chat tab? ===
+            uint8_t cf = this->ui->getUiState()->currentFrame;
+            bool inNodeChat = (g_favChatFirst != (size_t)-1 && cf >= g_favChatFirst && cf <= g_favChatLast);
+            bool inChanChat = (g_chanTabFirst != (size_t)-1 && cf >= g_chanTabFirst && cf <= g_chanTabLast);
+
+            // Helper function to calculate how many messages fit on screen with dynamic heights
+            auto calculateVisibleRowsDM = [&](uint32_t nodeId, int scrollIndex) -> int {
+                const auto &q = chat::ChatHistoryStore::instance().getDM(nodeId);
+                const int h = dispdev->getHeight();
+                const int lineH = 10;
+                const int availableHeight = h - 16; // account for UI elements
+                const int total = (int)q.size();
+
+                int usedHeight = 0;
+                int visibleCount = 0;
+
+                for (int i = 0; i < total - scrollIndex; ++i) {
+                    int itemIndex = total - 1 - (scrollIndex + i);
+                    if (itemIndex < 0)
+                        break;
+
+                    const auto &e = q[itemIndex];
+                    std::string who = e.outgoing ? "S" : "R";
+                    std::string base = who + ": " + e.text;
+                    bool needsExtra = needsExtraHeight(base);
+                    int currentLineH = needsExtra ? lineH * 3 : lineH;
+
+                    if (usedHeight + currentLineH <= availableHeight) {
+                        usedHeight += currentLineH;
+                        visibleCount++;
+                    } else {
+                        break;
+                    }
+                }
+
+                return std::max(1, std::min(visibleCount, 4)); // Ensure at least 1, max 4
+            };
+
+            auto moveSelDM = [&](uint32_t nodeId, int dir) {
+                const auto &q = chat::ChatHistoryStore::instance().getDM(nodeId);
+                const int total = (int)q.size();
+                if (total <= 0)
+                    return;
+
+                GlobalScrollState &st = g_nodeScroll[nodeId];
+                const int visibleRows = calculateVisibleRowsDM(nodeId, st.scrollIndex);
+
+                // Sliding window navigation
+                if (dir > 0) {
+                    if (st.sel < visibleRows - 1) {
+                        st.sel++;
+                    } else if (st.scrollIndex < total - visibleRows) {
+                        st.scrollIndex++;
+                        // Recalculate visible rows after scroll
+                        int newVisibleRows = calculateVisibleRowsDM(nodeId, st.scrollIndex);
+                        if (st.sel >= newVisibleRows) {
+                            st.sel = newVisibleRows - 1;
+                        }
+                    } else {
+                        // wrap to top
+                        st.sel = 0;
+                        st.scrollIndex = 0;
+                    }
+                } else if (dir < 0) {
+                    if (st.sel > 0) {
+                        st.sel--;
+                    } else if (st.scrollIndex > 0) {
+                        st.scrollIndex--;
+                        // Recalculate visible rows after scroll
+                        int newVisibleRows = calculateVisibleRowsDM(nodeId, st.scrollIndex);
+                        if (st.sel >= newVisibleRows) {
+                            st.sel = newVisibleRows - 1;
+                        }
+                    } else {
+                        // wrap to bottom
+                        st.scrollIndex = total - visibleRows;
+                        st.sel = visibleRows - 1;
+                    }
+                }
+                st.offset = 0;
+                st.lastMs = millis();
+                setFastFramerate();
+                forceDisplay();
+            };
+            // Helper function to calculate how many messages fit on screen with dynamic heights for channels
+            auto calculateVisibleRowsCH = [&](uint8_t ch, int scrollIndex) -> int {
+                const auto &q = chat::ChatHistoryStore::instance().getCHAN(ch);
+                const int h = dispdev->getHeight();
+                const int lineH = 10;
+                const int availableHeight = h - 16; // account for UI elements
+                const int total = (int)q.size();
+
+                int usedHeight = 0;
+                int visibleCount = 0;
+
+                for (int i = 0; i < total - scrollIndex; ++i) {
+                    int itemIndex = total - 1 - (scrollIndex + i);
+                    if (itemIndex < 0)
+                        break;
+
+                    const auto &e = q[itemIndex];
+                    std::string who = e.outgoing ? "S" : "R";
+                    std::string base = who + ": " + e.text;
+                    bool needsExtra = needsExtraHeight(base);
+                    int currentLineH = needsExtra ? lineH * 3 : lineH;
+
+                    if (usedHeight + currentLineH <= availableHeight) {
+                        usedHeight += currentLineH;
+                        visibleCount++;
+                    } else {
+                        break;
+                    }
+                }
+
+                return std::max(1, std::min(visibleCount, 4)); // Ensure at least 1, max 4
+            };
+
+            auto moveSelCH = [&](uint8_t ch, int dir) {
+                const auto &q = chat::ChatHistoryStore::instance().getCHAN(ch);
+                const int total = (int)q.size();
+                if (total <= 0)
+                    return;
+
+                GlobalScrollState &st = g_chanScroll[ch];
+                const int visibleRows = calculateVisibleRowsCH(ch, st.scrollIndex);
+
+                // Sliding window navigation
+                if (dir > 0) {
+                    if (st.sel < visibleRows - 1) {
+                        st.sel++;
+                    } else if (st.scrollIndex < total - visibleRows) {
+                        st.scrollIndex++;
+                        // Recalculate visible rows after scroll
+                        int newVisibleRows = calculateVisibleRowsCH(ch, st.scrollIndex);
+                        if (st.sel >= newVisibleRows) {
+                            st.sel = newVisibleRows - 1;
+                        }
+                    } else {
+                        // wrap to top
+                        st.sel = 0;
+                        st.scrollIndex = 0;
+                    }
+                } else if (dir < 0) {
+                    if (st.sel > 0) {
+                        st.sel--;
+                    } else if (st.scrollIndex > 0) {
+                        st.scrollIndex--;
+                        // Recalculate visible rows after scroll
+                        int newVisibleRows = calculateVisibleRowsCH(ch, st.scrollIndex);
+                        if (st.sel >= newVisibleRows) {
+                            st.sel = newVisibleRows - 1;
+                        }
+                    } else {
+                        // wrap to bottom
+                        st.scrollIndex = total - visibleRows;
+                        st.sel = visibleRows - 1;
+                    }
+                }
+                st.offset = 0;
+                st.lastMs = millis();
+                setFastFramerate();
+                forceDisplay();
+            };
+
+            // --- Scroll by short press in the CHAT SCREEN ---
+            const bool shortPressAsDown =
+                g_chatScrollByPress && (inNodeChat || inChanChat) &&
+                (event->inputEvent == INPUT_BROKER_USER_PRESS || event->inputEvent == INPUT_BROKER_SELECT);
+
+            if (inNodeChat || inChanChat) {
+                // --- move selection with UP/DOWN ---
+                if (event->inputEvent == INPUT_BROKER_UP) {
+                    if (inNodeChat) {
+                        uint32_t nodeId = g_favChatNodes[(size_t)cf - g_favChatFirst];
+                        moveSelDM(nodeId, -1);
+                    } else {
+                        uint8_t ch = g_chanTabs[(size_t)cf - g_chanTabFirst];
+                        moveSelCH(ch, -1);
+                    }
+                    return 1;
+                }
+
+                if (event->inputEvent == INPUT_BROKER_DOWN) {
+                    if (inNodeChat) {
+                        uint32_t nodeId = g_favChatNodes[(size_t)cf - g_favChatFirst];
+                        moveSelDM(nodeId, +1);
+                    } else {
+                        uint8_t ch = g_chanTabs[(size_t)cf - g_chanTabFirst];
+                        moveSelCH(ch, +1);
+                    }
+                    return 1;
+                }
+
+                // --- open message carousel with SELECT (direct access) ---
+                if (event->inputEvent == INPUT_BROKER_SELECT || event->inputEvent == INPUT_BROKER_SELECT_LONG) {
+                    if (inNodeChat) {
+                        size_t idx = (size_t)cf - g_favChatFirst;
+                        if (idx < g_favChatNodes.size()) {
+                            // Try to launch message carousel for node
+                            bool carouselLaunched = false;
+                            if (cannedMessageModule) {
+                                carouselLaunched = cannedMessageModule->LaunchMessageCarouselForNode(g_favChatNodes[idx]);
+                            }
+                            // If no messages, open chat menu instead
+                            if (!carouselLaunched) {
+#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN && !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+                                graphics::menuHandler::openChatActionsForNode(g_favChatNodes[idx]);
+#endif
+                            }
+                        }
+                    } else {
+                        size_t idx = (size_t)cf - g_chanTabFirst;
+                        if (idx < g_chanTabs.size()) {
+                            // Try to launch message carousel for channel
+                            bool carouselLaunched = false;
+                            if (cannedMessageModule) {
+                                carouselLaunched = cannedMessageModule->LaunchMessageCarouselForChannel(g_chanTabs[idx]);
+                            }
+                            // If no messages, open chat menu instead
+                            if (!carouselLaunched) {
+#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN && !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+                                graphics::menuHandler::openChatActionsForChannel(g_chanTabs[idx]);
+#endif
+                            }
+                        }
+                    }
+                    return 1;
+                }
+            }
+
+            // === Original global navigation ===
             if (event->inputEvent == INPUT_BROKER_LEFT || event->inputEvent == INPUT_BROKER_ALT_PRESS) {
                 showPrevFrame();
             } else if (event->inputEvent == INPUT_BROKER_RIGHT || event->inputEvent == INPUT_BROKER_USER_PRESS) {
                 showNextFrame();
             } else if (event->inputEvent == INPUT_BROKER_SELECT) {
-                if (this->ui->getUiState()->currentFrame == framesetInfo.positions.home) {
+                uint8_t cff = this->ui->getUiState()->currentFrame;
+
+                if (cff == framesetInfo.positions.home) {
                     menuHandler::homeBaseMenu();
-                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.system) {
+                } else if (cff == framesetInfo.positions.system) {
                     menuHandler::systemBaseMenu();
 #if HAS_GPS
-                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.gps && gps) {
+                } else if (cff == framesetInfo.positions.gps && gps) {
                     menuHandler::positionBaseMenu();
 #endif
-                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.clock) {
+                } else if (cff == framesetInfo.positions.clock) {
                     menuHandler::clockMenu();
-                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.lora) {
+                } else if (cff == framesetInfo.positions.lora) {
                     menuHandler::loraMenu();
-                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.textMessage) {
+                } else if (cff == framesetInfo.positions.textMessage) {
                     if (devicestate.rx_text_message.from) {
                         menuHandler::messageResponseMenu();
                     } else {
@@ -1616,19 +2684,17 @@ int Screen::handleInputEvent(const InputEvent *event)
                         menuHandler::textMessageBaseMenu();
 #endif
                     }
-                } else if (framesetInfo.positions.firstFavorite != 255 &&
-                           this->ui->getUiState()->currentFrame >= framesetInfo.positions.firstFavorite &&
-                           this->ui->getUiState()->currentFrame <= framesetInfo.positions.lastFavorite) {
+                } else if (framesetInfo.positions.firstFavorite != 255 && cff >= framesetInfo.positions.firstFavorite &&
+                           cff <= framesetInfo.positions.lastFavorite) {
                     menuHandler::favoriteBaseMenu();
-                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.nodelist ||
-                           this->ui->getUiState()->currentFrame == framesetInfo.positions.nodelist_lastheard ||
-                           this->ui->getUiState()->currentFrame == framesetInfo.positions.nodelist_hopsignal ||
-                           this->ui->getUiState()->currentFrame == framesetInfo.positions.nodelist_distance ||
-                           this->ui->getUiState()->currentFrame == framesetInfo.positions.nodelist_hopsignal ||
-                           this->ui->getUiState()->currentFrame == framesetInfo.positions.nodelist_bearings) {
+                } else if (cff == framesetInfo.positions.nodelist || cff == framesetInfo.positions.nodelist_lastheard ||
+                           cff == framesetInfo.positions.nodelist_hopsignal || cff == framesetInfo.positions.nodelist_distance ||
+                           cff == framesetInfo.positions.nodelist_hopsignal || cff == framesetInfo.positions.nodelist_bearings) {
                     menuHandler::nodeListMenu();
-                } else if (this->ui->getUiState()->currentFrame == framesetInfo.positions.wifi) {
+                } else if (cff == framesetInfo.positions.wifi) {
+#if HAS_WIFI
                     menuHandler::wifiBaseMenu();
+#endif
                 }
             } else if (event->inputEvent == INPUT_BROKER_BACK) {
                 showPrevFrame();
@@ -1662,20 +2728,148 @@ bool Screen::isOverlayBannerShowing()
     return NotificationRenderer::isOverlayBannerShowing();
 }
 
-} // namespace graphics
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+void Screen::openMqttInfoScreen()
+{
+    // Hide MQTT frame from carousel when showing status screen
+    hiddenFrames.mqtt = true;
+
+    // Set flag to track MQTT status screen is showing
+    graphics::UIRenderer::showingMqttStatus = true;
+
+    // Create a FrameCallback with the drawMqttInfoDirect function
+    setFrameImmediateDraw(new FrameCallback([](OLEDDisplay *d, OLEDDisplayUiState *s, int16_t x, int16_t y) {
+        graphics::UIRenderer::drawMqttInfoDirect(d, s, x, y);
+    }));
+}
+
+void Screen::openWifiInfoScreen()
+{
+    // Hide WiFi frame from carousel when showing status screen
+    hiddenFrames.wifi = true;
+
+    // Set flag to track WiFi status screen is showing
+    graphics::UIRenderer::showingWifiStatus = true;
+
+    // Create a FrameCallback with the drawWifiInfoDirect function
+    setFrameImmediateDraw(new FrameCallback([](OLEDDisplay *d, OLEDDisplayUiState *s, int16_t x, int16_t y) {
+        graphics::UIRenderer::drawWifiInfoDirect(d, s, x, y);
+    }));
+}
+
+void Screen::hideFrame(const std::string &frameName)
+{
+#ifndef USE_EINK
+    if (frameName == "nodelist") {
+        hiddenFrames.nodelist = true;
+    }
+#endif
+#ifdef USE_EINK
+    if (frameName == "nodelist_lastheard") {
+        hiddenFrames.nodelist_lastheard = true;
+    }
+    if (frameName == "nodelist_hopsignal") {
+        hiddenFrames.nodelist_hopsignal = true;
+    }
+    if (frameName == "nodelist_distance") {
+        hiddenFrames.nodelist_distance = true;
+    }
+#endif
+#if HAS_GPS
+    if (frameName == "nodelist_bearings") {
+        hiddenFrames.nodelist_bearings = true;
+    }
+    if (frameName == "gps") {
+        hiddenFrames.gps = true;
+    }
+#endif
+    if (frameName == "lora") {
+        hiddenFrames.lora = true;
+    }
+    if (frameName == "clock") {
+        hiddenFrames.clock = true;
+    }
+    if (frameName == "show_favorites") {
+        hiddenFrames.show_favorites = true;
+    }
+    if (frameName == "chirpy") {
+        hiddenFrames.chirpy = true;
+    }
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    if (frameName == "wifi") {
+        hiddenFrames.wifi = true;
+    }
+#endif
+}
+
+void Screen::showFrame(const std::string &frameName)
+{
+#ifndef USE_EINK
+    if (frameName == "nodelist") {
+        hiddenFrames.nodelist = false;
+    }
+#endif
+#ifdef USE_EINK
+    if (frameName == "nodelist_lastheard") {
+        hiddenFrames.nodelist_lastheard = false;
+    }
+    if (frameName == "nodelist_hopsignal") {
+        hiddenFrames.nodelist_hopsignal = false;
+    }
+    if (frameName == "nodelist_distance") {
+        hiddenFrames.nodelist_distance = false;
+    }
+#endif
+#if HAS_GPS
+    if (frameName == "nodelist_bearings") {
+        hiddenFrames.nodelist_bearings = false;
+    }
+    if (frameName == "gps") {
+        hiddenFrames.gps = false;
+    }
+#endif
+    if (frameName == "lora") {
+        hiddenFrames.lora = false;
+    }
+    if (frameName == "clock") {
+        hiddenFrames.clock = false;
+    }
+    if (frameName == "show_favorites") {
+        hiddenFrames.show_favorites = false;
+    }
+    if (frameName == "chirpy") {
+        hiddenFrames.chirpy = false;
+    }
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+    if (frameName == "wifi") {
+        hiddenFrames.wifi = false;
+    }
+#endif
+}
+
+#endif // HAS_SCREEN
 
 #else
 graphics::Screen::Screen(ScanI2C::DeviceAddress, meshtastic_Config_DisplayConfig_OledType, OLEDDISPLAY_GEOMETRY) {}
 #endif // HAS_SCREEN
 
+} // namespace graphics
+
 bool shouldWakeOnReceivedMessage()
 {
     /*
     The goal here is to determine when we do NOT wake up the screen on message received:
+    - Chat silent mode is enabled
     - Any ext. notifications are turned on
     - If role is not CLIENT / CLIENT_MUTE / CLIENT_HIDDEN / CLIENT_BASE
     - If the battery level is very low
     */
+
+    // Check silent mode first
+    if (g_chatSilentMode) {
+        return false;
+    }
+
     if (moduleConfig.external_notification.enabled) {
         return false;
     }
@@ -1689,3 +2883,5 @@ bool shouldWakeOnReceivedMessage()
     }
     return true;
 }
+
+#endif // HAS_SCREEN

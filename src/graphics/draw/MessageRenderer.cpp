@@ -56,6 +56,13 @@ namespace graphics
 namespace MessageRenderer
 {
 
+// Forward declarations
+static int s_pendingPageDown = 0;
+void requestPageDown()
+{
+    s_pendingPageDown++;
+}
+
 // Simple cache based on text hash
 static size_t cachedKey = 0;
 static std::vector<std::string> cachedLines;
@@ -205,7 +212,7 @@ void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
     snprintf(messageBuf, sizeof(messageBuf), "%s", msg);
     if (strlen(messageBuf) == 0) {
         // === Header ===
-        graphics::drawCommonHeader(display, x, y, titleStr);
+        graphics::drawCommonHeader(display, x, y, titleStr, false, false, true); // Hide unread counter
         const char *messageString = "No messages";
         int center_text = (SCREEN_WIDTH / 2) - (display->getStringWidth(messageString) / 2);
 #if defined(M5STACK_UNITC6L)
@@ -260,7 +267,7 @@ void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
 #endif
     }
 #if defined(M5STACK_UNITC6L)
-    graphics::drawCommonHeader(display, x, y, titleStr);
+    graphics::drawCommonHeader(display, x, y, titleStr, false, false, true); // Hide unread counter
     int headerY = getTextPositions(display)[1];
     display->drawString(x, headerY, headerStr);
     for (int separatorX = 0; separatorX < SCREEN_WIDTH; separatorX += 2) {
@@ -337,7 +344,7 @@ void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
             display->drawXbm((SCREEN_WIDTH - e.width) / 2, emoteY, e.width, e.height, e.bitmap);
 
             // Draw header at the end to sort out overlapping elements
-            graphics::drawCommonHeader(display, x, y, titleStr);
+            graphics::drawCommonHeader(display, x, y, titleStr, false, false, true); // Hide unread counter
             return;
         }
     }
@@ -376,6 +383,16 @@ void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
     static float scrollY = 0.0f;
     static uint32_t lastTime = 0, scrollStartDelay = 0, pauseStart = 0;
     static bool waitingToReset = false, scrollStarted = false;
+
+    // Handle any pending page down requests
+    if (s_pendingPageDown > 0) {
+        float page = (float)usableScrollHeight * 0.9f; // 90% page
+        s_pendingPageDown = 0;
+
+        // If we're already at the bottom, reset to top
+        scrollStarted = true;
+        scrollStartDelay = lastTime;
+    }
 
     // === Smooth scrolling adjustment ===
     // You can tweak this divisor to change how smooth it scrolls.
@@ -421,7 +438,7 @@ void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
     renderMessageContent(display, cachedLines, cachedHeights, x, yOffset, scrollBottom, emotes, numEmotes, isInverted, isBold);
 
     // Draw header at the end to sort out overlapping elements
-    graphics::drawCommonHeader(display, x, y, titleStr);
+    graphics::drawCommonHeader(display, x, y, titleStr, false, false, true); // Hide unread counter
 #endif
 }
 
@@ -523,6 +540,140 @@ void renderMessageContent(OLEDDisplay *display, const std::vector<std::string> &
             }
         }
     }
+}
+
+// Draws a chat message frame for chat carousel - adapted from drawTextMessageFrame
+void drawChatMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y, const std::string &chatTitle,
+                          const std::string &messageText, const std::string &senderName, uint32_t timestamp)
+{
+    // Clear the unread message indicator when viewing the message
+    hasUnreadMessage = false;
+
+    display->clear();
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    display->setFont(FONT_SMALL);
+
+    const int navHeight = FONT_HEIGHT_SMALL;
+    const int scrollBottom = SCREEN_HEIGHT - navHeight;
+    const int usableHeight = scrollBottom;
+    const int textWidth = SCREEN_WIDTH;
+
+    bool isInverted = (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_INVERTED);
+    bool isBold = config.display.heading_bold;
+
+    // Set title (chat name)
+    const char *titleStr = chatTitle.c_str();
+
+    // Check if we have a message to show
+    if (messageText.empty()) {
+        // Header
+        graphics::drawCommonHeader(display, x, y, titleStr, false, false, true); // Hide unread counter
+        const char *messageString = "No messages";
+        int center_text = (SCREEN_WIDTH / 2) - (display->getStringWidth(messageString) / 2);
+        display->drawString(center_text, getTextPositions(display)[2], messageString);
+        return;
+    }
+
+    // Header Construction - format timestamp and sender
+    char headerStr[80];
+
+    // Calculate time ago from timestamp
+    uint32_t now = (uint32_t)time(nullptr);
+    if (now == 0)
+        now = millis() / 1000;
+    uint32_t seconds = (now > timestamp) ? (now - timestamp) : 0;
+    uint32_t minutes = seconds / 60, hours = minutes / 60, days = hours / 24;
+
+    // Format header similar to original
+    if (days > 0) {
+        snprintf(headerStr, sizeof(headerStr), "%dd ago from %s", (int)days, senderName.c_str());
+    } else if (hours > 0) {
+        snprintf(headerStr, sizeof(headerStr), "%dh ago from %s", (int)hours, senderName.c_str());
+    } else if (minutes > 0) {
+        snprintf(headerStr, sizeof(headerStr), "%dm ago from %s", (int)minutes, senderName.c_str());
+    } else {
+        snprintf(headerStr, sizeof(headerStr), "Now from %s", senderName.c_str());
+    }
+
+    // Convert message to C string for rendering
+    const char *messageBuf = messageText.c_str();
+
+    // Use the same emote detection logic as original
+    const Emote *emotes = graphics::emotes;
+    int numEmotes = graphics::numEmotes;
+
+    // Check if message is pure emote
+    for (int i = 0; i < numEmotes; ++i) {
+        const Emote &e = emotes[i];
+        if (messageText == e.label) {
+            // Render pure emote (similar to original logic)
+            int headerY = getTextPositions(display)[1];
+            display->drawString(x + 3, headerY, headerStr);
+            if (isInverted && isBold)
+                display->drawString(x + 4, headerY, headerStr);
+
+            // Draw separator
+            for (int separatorX = 1; separatorX <= (display->getStringWidth(headerStr) + 2); separatorX += 2) {
+                display->setPixel(separatorX, headerY + ((isHighResolution) ? 19 : 13));
+            }
+
+            // Center the emote
+            int remainingHeight = SCREEN_HEIGHT - (headerY + FONT_HEIGHT_SMALL) - navHeight;
+            int emoteY = headerY + 6 + FONT_HEIGHT_SMALL + (remainingHeight - e.height) / 2;
+            display->drawXbm((SCREEN_WIDTH - e.width) / 2, emoteY, e.width, e.height, e.bitmap);
+
+            // Draw header at the end
+            graphics::drawCommonHeader(display, x, y, titleStr, false, false, true); // Hide unread counter
+            return;
+        }
+    }
+
+    // Generate cache key for this message
+    size_t currentKey = std::hash<std::string>{}(messageText + senderName + std::to_string(timestamp));
+
+    if (cachedKey != currentKey) {
+        // Cache miss - regenerate lines and heights
+        cachedLines = generateLines(display, headerStr, messageBuf, textWidth);
+        cachedHeights = calculateLineHeights(cachedLines, emotes);
+        cachedKey = currentKey;
+    } else {
+        // Cache hit but update the header line with current information
+        cachedLines[0] = std::string(headerStr);
+        cachedHeights[0] = FONT_HEIGHT_SMALL - 2;
+        if (cachedHeights[0] < 8)
+            cachedHeights[0] = 8;
+    }
+
+    // Scrolling logic (simplified - no auto-scroll for chat messages)
+    int totalHeight = 0;
+    for (size_t i = 1; i < cachedHeights.size(); ++i) {
+        totalHeight += cachedHeights[i];
+    }
+    int usableScrollHeight = usableHeight - cachedHeights[0];
+
+    // Static scroll position (could be extended with per-chat scroll state)
+    static float scrollY = 0.0f;
+
+    if (totalHeight > usableScrollHeight) {
+        // For chat messages, just show from the beginning (no auto-scroll)
+        scrollY = 0.0f;
+    } else {
+        scrollY = 0.0f;
+    }
+
+    int scrollOffset = static_cast<int>(scrollY);
+    int yOffset = -scrollOffset + getTextPositions(display)[1];
+
+    // Draw separator line under header
+    for (int separatorX = 1; separatorX <= (display->getStringWidth(headerStr) + 2); separatorX += 2) {
+        display->setPixel(separatorX, yOffset + ((isHighResolution) ? 19 : 13));
+    }
+
+    // Render visible lines using the same logic as original
+    renderMessageContent(display, cachedLines, cachedHeights, x, yOffset, scrollBottom, emotes, numEmotes, isInverted, isBold);
+
+    // Draw header at the end to sort out overlapping elements
+    graphics::drawCommonHeader(display, x, y, titleStr, false, false, true); // Hide unread counter
 }
 
 } // namespace MessageRenderer

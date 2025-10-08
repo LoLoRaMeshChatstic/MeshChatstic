@@ -274,4 +274,40 @@ const unsigned char bell_icon[] PROGMEM = {
     0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000};
 #endif
 
+// Function to get unique emojis (no duplicates with same bitmap)
+const Emote *getUniqueEmotes(int &count)
+{
+    static Emote uniqueEmotes[64]; // Max unique emojis
+    static bool initialized = false;
+    static int uniqueCount = 0;
+
+    if (!initialized) {
+        uniqueCount = 0;
+
+        // Add emojis, but skip those that use the same bitmap as previous ones
+        for (int i = 0; i < numEmotes; ++i) {
+            bool isDuplicate = false;
+
+            // Check if this bitmap is already in our unique list
+            for (int j = 0; j < uniqueCount; ++j) {
+                if (uniqueEmotes[j].bitmap == emotes[i].bitmap) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+
+            // Only add if it's not a duplicate
+            if (!isDuplicate && uniqueCount < 64) {
+                uniqueEmotes[uniqueCount] = emotes[i];
+                uniqueCount++;
+            }
+        }
+
+        initialized = true;
+    }
+
+    count = uniqueCount;
+    return uniqueEmotes;
+}
+
 } // namespace graphics

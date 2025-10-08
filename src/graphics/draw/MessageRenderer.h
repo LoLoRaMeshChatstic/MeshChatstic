@@ -10,11 +10,18 @@ namespace graphics
 namespace MessageRenderer
 {
 
+// Call this to request a page down on the next frame render
+void requestPageDown();
+
 // Text and emote rendering
 void drawStringWithEmotes(OLEDDisplay *display, int x, int y, const std::string &line, const Emote *emotes, int emoteCount);
 
 /// Draws the text message frame for displaying received messages
 void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
+
+/// Draws a chat message frame for a specific chat entry (for chat carousel)
+void drawChatMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y, const std::string &chatTitle,
+                          const std::string &messageText, const std::string &senderName, uint32_t timestamp);
 
 // Function to generate lines with word wrapping
 std::vector<std::string> generateLines(OLEDDisplay *display, const char *headerStr, const char *messageBuf, int textWidth);

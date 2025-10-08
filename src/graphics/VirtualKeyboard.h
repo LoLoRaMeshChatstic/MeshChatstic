@@ -43,6 +43,9 @@ class VirtualKeyboard
     void resetTimeout();
     bool isTimedOut() const;
 
+    // Layer management
+    void toggleLayer();
+
   private:
     static const uint8_t KEYBOARD_ROWS = 4;
     static const uint8_t KEYBOARD_COLS = 11;
@@ -61,6 +64,9 @@ class VirtualKeyboard
 
     // Timeout management for auto-exit
     uint32_t lastActivityTime;
+    // Layer management for uppercase/symbols
+    bool upperCaseLayer;
+
     static const uint32_t TIMEOUT_MS = 60000; // 1 minute timeout
 
     void initializeKeyboard();
