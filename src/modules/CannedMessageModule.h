@@ -1,8 +1,7 @@
 #pragma once
-#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
+#if HAS_SCREEN
 #include "ProtobufModule.h"
 #include "input/InputBroker.h"
-#include <functional>
 
 // ============================
 //        Enums & Defines
@@ -18,12 +17,9 @@ enum cannedMessageModuleRunState {
     CANNED_MESSAGE_RUN_STATE_ACTION_UP,
     CANNED_MESSAGE_RUN_STATE_ACTION_DOWN,
     CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION,
-    CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION_FOR_EMOTE, // New state for emote destination selection
     CANNED_MESSAGE_RUN_STATE_FREETEXT,
     CANNED_MESSAGE_RUN_STATE_MESSAGE_SELECTION,
-    CANNED_MESSAGE_RUN_STATE_EMOTE_PICKER,
-    CANNED_MESSAGE_RUN_STATE_EMOTE_CAROUSEL,
-    CANNED_MESSAGE_RUN_STATE_MESSAGE_CAROUSEL
+    CANNED_MESSAGE_RUN_STATE_EMOTE_PICKER
 };
 
 enum CannedMessageModuleIconType { shift, backspace, space, enter };
@@ -64,25 +60,10 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
 
     void LaunchWithDestination(NodeNum, uint8_t newChannel = 0);
     void LaunchRepeatDestination();
-    void LaunchFreetextWithDestination(NodeNum newDest, uint8_t newChannel = 0);
-    void LaunchEmoteWithDestination(NodeNum newDest, uint8_t newChannel = 0);
-    bool LaunchMessageCarouselForNode(NodeNum nodeId);
-    bool LaunchMessageCarouselForChannel(uint8_t ch);
-    void LaunchEmotePickerWithDestination(NodeNum, uint8_t newChannel = 0);
-    void LaunchEmoteDestinationSelection();                  // Launch destination selection for emote messages
-    void LaunchEmoteCarousel(NodeNum dest, uint8_t channel); // Launch emoji carousel for sending
-    void LaunchFreetextPrompt(const char *header, const std::string &initial, std::function<void(const std::string &)> onSubmit);
-    void LaunchFreetextKbPrompt(const char *header, const std::string &initial, std::function<void(const std::string &)> onSubmit,
-                                bool isConfigMode = false);
+    void LaunchFreetextWithDestination(NodeNum, uint8_t newChannel = 0);
 
     // === Emote Picker navigation ===
     int emotePickerIndex = 0; // Tracks currently selected emote in the picker
-
-    // === Emoji Carousel ===
-    bool emoteCarouselActive = false;
-    NodeNum emoteCarouselDest = NODENUM_BROADCAST;
-    uint8_t emoteCarouselChannel = 0;
-    int emoteCarouselIndex = 0; // Current emoji index in carousel
 
     // === Message navigation ===
     const char *getCurrentMessage();
@@ -104,35 +85,6 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
     // === Emote Picker ===
     int handleEmotePickerInput(const InputEvent *event);
     void drawEmotePickerScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
-
-    // === Emote Carousel ===
-    int handleEmoteCarouselInput(const InputEvent *event);
-    void drawEmoteCarouselScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
-
-#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
-    // === Message Carousel ===
-    bool messageCarouselActive = false;
-    NodeNum messageCarouselNodeId = NODENUM_BROADCAST;
-    uint8_t messageCarouselChannel = 0;
-    bool messageCarouselIsChannel = false;
-    int messageCarouselIndex = 0;        // Current message index in carousel
-    int messageCarouselScrollOffset = 0; // Scroll offset for long messages
-    bool scrollingActive = false;        // For autoscroll functionality
-    std::vector<String> messageCarouselMessages;
-    std::vector<uint32_t> messageCarouselTimestamps;
-    std::vector<NodeNum> messageCarouselSenders;
-    std::vector<bool> messageCarouselUnreadStatus; // Track unread status of each message
-
-    int handleMessageCarouselInput(const InputEvent *event);
-    void drawMessageCarouselScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y);
-    void loadMessagesForCarousel();
-    void markCurrentMessageAsRead(); // Mark current message as read and update unread count
-    String formatMessageTimestamp(uint32_t timestamp);
-    void closeMessageCarousel();    // Public method to close carousel from external code
-    void refreshCarouselIfActive(); // Refresh carousel when new messages arrive
-    bool isCarouselShowingConversation(uint32_t nodeId, uint8_t channel,
-                                       bool isChannel); // Check if carousel is showing specific conversation
-#endif
 
     // === Admin Handlers ===
     void handleGetCannedMessageModuleMessages(const meshtastic_MeshPacket &req, meshtastic_AdminMessage *response);
@@ -229,11 +181,6 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
     char highlight = 0x00;
     char payload = 0x00;
     unsigned int cursor = 0;
-
-    // === Custom Callback for WiFi prompt ===
-    std::function<void(const std::string &)> customCallback = nullptr;
-    String customHeader = "";
-    bool isConfigurationMode = false; // true para server/pass, false para mensajes
     unsigned long lastTouchMillis = 0;
     uint32_t lastFilterUpdate = 0;
     static constexpr uint32_t filterDebounceMs = 30;
@@ -244,7 +191,6 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
     bool shift = false;
     int charSet = 0; // 0=ABC, 1=123
 #endif
-    bool emoteDirectSend = false;
 
     bool isUpEvent(const InputEvent *event);
     bool isDownEvent(const InputEvent *event);

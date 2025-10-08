@@ -15,9 +15,6 @@ struct Emote {
 extern const Emote emotes[/* numEmotes */];
 extern const int numEmotes;
 
-// Function to get unique emojis (no duplicates with same bitmap)
-const Emote *getUniqueEmotes(int &count);
-
 #ifndef EXCLUDE_EMOJI
 // === Emote Bitmaps ===
 #define thumbs_height 25

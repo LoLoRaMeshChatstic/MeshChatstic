@@ -27,6 +27,10 @@
  */
 class FloodingRouter : public Router
 {
+  private:
+    /* Check if we should rebroadcast this packet, and do so if needed */
+    void perhapsRebroadcast(const meshtastic_MeshPacket *p);
+
   public:
     /**
      * Constructor

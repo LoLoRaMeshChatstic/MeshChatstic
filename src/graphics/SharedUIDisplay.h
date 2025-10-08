@@ -48,13 +48,9 @@ void determineResolution(int16_t screenheight, int16_t screenwidth);
 // Rounded highlight (used for inverted headers)
 void drawRoundedHighlight(OLEDDisplay *display, int16_t x, int16_t y, int16_t w, int16_t h, int16_t r);
 
-// Helper function for unread count display
-int drawUnreadCountOrMuteIcon(OLEDDisplay *display, int unreadCount, bool isMuted, int rightEdgeX, int textY, bool isInverted,
-                              bool force_no_invert);
-
 // Shared battery/time/mail header
 void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *titleStr = "", bool force_no_invert = false,
-                      bool show_date = false, bool hideUnreadCounter = false);
+                      bool show_date = false);
 
 const int *getTextPositions(OLEDDisplay *display);
 

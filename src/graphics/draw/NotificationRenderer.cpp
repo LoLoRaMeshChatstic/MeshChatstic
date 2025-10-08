@@ -185,8 +185,7 @@ void NotificationRenderer::drawNumberPicker(OLEDDisplay *display, OLEDDisplayUiS
         curSelected++;
     } else if (inEvent.inputEvent == INPUT_BROKER_LEFT) {
         curSelected--;
-    } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG ||
-                (inEvent.inputEvent == INPUT_BROKER_ANYKEY && (inEvent.kbchar == 27 || inEvent.kbchar == 'q'))) &&
+    } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG) &&
                alertBannerUntil != 0) {
         resetBanner();
         return;
@@ -251,16 +250,17 @@ void NotificationRenderer::drawNodePicker(OLEDDisplay *display, OLEDDisplayUiSta
     }
 
     // Handle input
-    if (inEvent.inputEvent == INPUT_BROKER_UP || inEvent.inputEvent == INPUT_BROKER_ALT_PRESS) {
+    if (inEvent.inputEvent == INPUT_BROKER_UP || inEvent.inputEvent == INPUT_BROKER_LEFT ||
+        inEvent.inputEvent == INPUT_BROKER_ALT_PRESS) {
         curSelected--;
-    } else if (inEvent.inputEvent == INPUT_BROKER_DOWN || inEvent.inputEvent == INPUT_BROKER_USER_PRESS) {
+    } else if (inEvent.inputEvent == INPUT_BROKER_DOWN || inEvent.inputEvent == INPUT_BROKER_RIGHT ||
+               inEvent.inputEvent == INPUT_BROKER_USER_PRESS) {
         curSelected++;
     } else if (inEvent.inputEvent == INPUT_BROKER_SELECT) {
         alertBannerCallback(selectedNodenum);
         resetBanner();
         return;
-    } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG ||
-                (inEvent.inputEvent == INPUT_BROKER_ANYKEY && (inEvent.kbchar == 27 || inEvent.kbchar == 'q'))) &&
+    } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG) &&
                alertBannerUntil != 0) {
         resetBanner();
         return;
@@ -367,9 +367,11 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
 
     // Handle input
     if (alertBannerOptions > 0) {
-        if (inEvent.inputEvent == INPUT_BROKER_UP || inEvent.inputEvent == INPUT_BROKER_ALT_PRESS) {
+        if (inEvent.inputEvent == INPUT_BROKER_UP || inEvent.inputEvent == INPUT_BROKER_LEFT ||
+            inEvent.inputEvent == INPUT_BROKER_ALT_PRESS) {
             curSelected--;
-        } else if (inEvent.inputEvent == INPUT_BROKER_DOWN || inEvent.inputEvent == INPUT_BROKER_USER_PRESS) {
+        } else if (inEvent.inputEvent == INPUT_BROKER_DOWN || inEvent.inputEvent == INPUT_BROKER_RIGHT ||
+                   inEvent.inputEvent == INPUT_BROKER_USER_PRESS) {
             curSelected++;
         } else if (inEvent.inputEvent == INPUT_BROKER_SELECT) {
             if (optionsEnumPtr != nullptr) {
@@ -380,34 +382,8 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
             }
             resetBanner();
             return;
-        } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG ||
-                    (inEvent.inputEvent == INPUT_BROKER_ANYKEY && (inEvent.kbchar == 27 || inEvent.kbchar == 'q'))) &&
+        } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG) &&
                    alertBannerUntil != 0) {
-            // Handle ESC key - look for "Back" option and call callback with that value
-            // ESC can come as: INPUT_BROKER_CANCEL (CardKB with sym+q) or INPUT_BROKER_ANYKEY with kbchar=27 (ASCII ESC) or
-            // kbchar='q' (CardKB without sym)
-            if (alertBannerCallback) {
-                // Search for "Back" option in the options array
-                int backOption = -1;
-                for (int i = 0; i < alertBannerOptions; i++) {
-                    if (optionsArrayPtr && optionsArrayPtr[i] && strcmp(optionsArrayPtr[i], "Back") == 0) {
-                        backOption = i;
-                        break;
-                    }
-                }
-
-                if (backOption >= 0) {
-                    // Found "Back" option - call callback with its enum value
-                    if (optionsEnumPtr != nullptr) {
-                        alertBannerCallback(optionsEnumPtr[backOption]);
-                    } else {
-                        alertBannerCallback(backOption);
-                    }
-                    resetBanner();
-                    return;
-                }
-            }
-            // If no "Back" option found, just reset banner (old behavior)
             resetBanner();
             return;
         }
@@ -418,8 +394,7 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
             curSelected = 0;
     } else {
         if (inEvent.inputEvent == INPUT_BROKER_SELECT || inEvent.inputEvent == INPUT_BROKER_ALT_LONG ||
-            inEvent.inputEvent == INPUT_BROKER_CANCEL ||
-            (inEvent.inputEvent == INPUT_BROKER_ANYKEY && (inEvent.kbchar == 27 || inEvent.kbchar == 'q'))) {
+            inEvent.inputEvent == INPUT_BROKER_CANCEL) {
             resetBanner();
             return;
         }

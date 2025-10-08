@@ -28,9 +28,6 @@ struct BannerOverlayOptions {
 
 bool shouldWakeOnReceivedMessage();
 
-// Global variable for chat silent mode
-extern bool g_chatSilentMode;
-
 #if !HAS_SCREEN
 #include "power.h"
 namespace graphics
@@ -223,15 +220,9 @@ class Screen : public concurrency::OSThread
 
   public:
     OLEDDisplay *getDisplayDevice() { return dispdev; }
-    OLEDDisplayUi *getUI() { return ui; }
-    bool isShowingNormalScreen() const { return showingNormalScreen; }
     explicit Screen(ScanI2C::DeviceAddress, meshtastic_Config_DisplayConfig_OledType, OLEDDISPLAY_GEOMETRY);
     size_t frameCount = 0; // Total number of active frames
     ~Screen();
-    void openNodeInfoFor(NodeNum nodeNum); // Opens direct the node info screen for a specific node
-#if HAS_WIFI && !defined(ARCH_PORTDUINO)
-    void openMqttInfoScreen();             // Opens direct the MQTT status info screen
-#endif
 
     // Which frame we want to be displayed, after we regen the frameset by calling setFrames
     enum FrameFocus : uint8_t {
@@ -314,37 +305,10 @@ class Screen : public concurrency::OSThread
     void showSimpleBanner(const char *message, uint32_t durationMs = 0);
     void showOverlayBanner(BannerOverlayOptions);
 
-#if HAS_WIFI && !defined(ARCH_PORTDUINO)
-    void openWifiInfoScreen(); // Opens direct the WiFi status info screen
-#endif
-
     void showNodePicker(const char *message, uint32_t durationMs, std::function<void(uint32_t)> bannerCallback);
     void showNumberPicker(const char *message, uint32_t durationMs, uint8_t digits, std::function<void(uint32_t)> bannerCallback);
     void showTextInput(const char *header, const char *initialText, uint32_t durationMs,
                        std::function<void(const std::string &)> textCallback);
-    // to jump to a specific frame
-    void jumpToFrame(uint8_t frame)
-    {
-        if (ui)
-            ui->switchToFrame(frame);
-    }
-
-    // wrapper to show a single frame quickly
-    void showSingleFrame(FrameCallback cb)
-    {
-        FrameCallback tmp[1] = {cb};
-        ui->setFrames(tmp, 1);
-        setFastFramerate();
-        forceDisplay(true);
-    }
-
-    void showCustomFrame(FrameCallback *frames, uint8_t count, FrameFocus focus = FOCUS_DEFAULT)
-    {
-        ui->disableAllIndicators();
-        ui->setFrames(frames, count);
-        setFastFramerate();
-        forceDisplay(true);
-    }
 
     void requestMenu(graphics::menuHandler::screenMenus menuToShow)
     {
@@ -389,9 +353,6 @@ class Screen : public concurrency::OSThread
         setFastFramerate();
         enqueueCmd(ScreenCmd{.cmd = Cmd::NOOP});
     }
-
-    // Function to draw text with emote support (public access for modules)
-    static void drawLineWithEmotes(OLEDDisplay *display, int16_t x, int16_t y, const char *s);
 
     /// Overrides the default utf8 character conversion, to replace empty space with question marks
     static char customFontTableLookup(const uint8_t ch)
@@ -619,9 +580,6 @@ class Screen : public concurrency::OSThread
     int handleInputEvent(const InputEvent *arg);
     int handleAdminMessage(AdminModule_ObserverData *arg);
 
-    // Shows a WhatsApp-style banner for new messages instead of auto-jumping
-    void showNewMessageBanner(const meshtastic_MeshPacket *packet);
-
     /// Used to force (super slow) eink displays to draw critical frames
     void forceDisplay(bool forceUiUpdate = false);
 
@@ -633,17 +591,12 @@ class Screen : public concurrency::OSThread
 
     // Menu-driven Show / Hide Toggle
     void toggleFrameVisibility(const std::string &frameName);
-    void hideFrame(const std::string &frameName);
-    void showFrame(const std::string &frameName);
     bool isFrameHidden(const std::string &frameName) const;
 
 #ifdef USE_EINK
     /// Draw an image to remain on E-Ink display after screen off
     void setScreensaverFrames(FrameCallback einkScreensaver = NULL);
 #endif
-
-    /// Check for inactivity timeouts and handle home navigation
-    void checkInactivityTimeouts();
 
   protected:
     /// Updates the UI.
@@ -723,7 +676,6 @@ class Screen : public concurrency::OSThread
         bool textMessage = false;
         bool waypoint = false;
         bool wifi = false;
-        bool mqtt = false;
         bool system = false;
         bool home = false;
         bool clock = false;
@@ -779,9 +731,6 @@ class Screen : public concurrency::OSThread
     /// UI helper for rendering to frames and switching between them
     OLEDDisplayUi *ui;
 };
-
-// Marquee auto-scroll functions
-void resetScrollToTop(uint32_t nodeIdOrDest, bool isDM);
 
 } // namespace graphics
 
