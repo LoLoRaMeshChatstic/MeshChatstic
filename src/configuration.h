@@ -449,17 +449,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // // Turn off wifi even if HW supports wifi (webserver relies on wifi and is also disabled)
 #ifdef MESHTASTIC_EXCLUDE_WIFI
 
-// Exclude persistent chat history on memory-constrained devices like nRF52
-// This keeps basic chat functionality but removes carousel and persistent storage
+// Chat history modes for memory-constrained devices
+// CHAT_MEMORY_ONLY: Keep limited history in RAM only (no persistence)
+// MESHTASTIC_EXCLUDE_CHAT_HISTORY: Only last message per conversation
 #if defined(ARCH_NRF52) || defined(ARCH_RP2040)
-#define MESHTASTIC_EXCLUDE_CHAT_HISTORY 1
+#define CHAT_MEMORY_ONLY 1
+// Enable limited chat history (30 messages) in RAM without persistence
+// This gives carousel functionality while saving Flash space
 #endif
 
-// Exclude persistent chat history on memory-constrained devices like nRF52
-// This keeps basic chat functionality but removes carousel and persistent storage
-#if defined(ARCH_NRF52) || defined(ARCH_RP2040)
-#define MESHTASTIC_EXCLUDE_CHAT_HISTORY 1
-#endif
 #define MESHTASTIC_EXCLUDE_WEBSERVER 1
 #undef HAS_WIFI
 #define HAS_WIFI 0

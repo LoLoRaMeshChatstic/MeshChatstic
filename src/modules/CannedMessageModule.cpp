@@ -2940,7 +2940,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
         messageCarouselIsChannel = false;
         messageCarouselIndex = 0;
 
-#if defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && !defined(CHAT_MEMORY_ONLY)
         // For memory-constrained devices, go directly to chat menu instead of carousel
         graphics::menuHandler::openChatActionsForNode(nodeId);
         return true;
@@ -2964,7 +2964,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
         messageCarouselIsChannel = true;
         messageCarouselIndex = 0;
 
-#if defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && !defined(CHAT_MEMORY_ONLY)
         // For memory-constrained devices, go directly to chat menu instead of carousel
         graphics::menuHandler::openChatActionsForChannel(ch);
         return true;
@@ -2983,7 +2983,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
 
 #endif // !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
 
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
     void CannedMessageModule::loadMessagesForCarousel()
     {
         messageCarouselMessages.clear();
@@ -3058,7 +3058,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
             markCurrentMessageAsRead();
         }
     }
-#endif // !MESHTASTIC_EXCLUDE_CHAT_HISTORY
+#endif // !MESHTASTIC_EXCLUDE_CHAT_HISTORY || CHAT_MEMORY_ONLY
 
     String CannedMessageModule::formatMessageTimestamp(uint32_t timestamp)
     {
@@ -3085,7 +3085,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
         }
     }
 
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
     int CannedMessageModule::handleMessageCarouselInput(const InputEvent *event)
     {
         if (messageCarouselMessages.empty()) {
@@ -3095,7 +3095,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
 
             if (isSelect || key == 13) { // ENTER key - open chat menu for sending
                                          // Open chat menu for the current conversation
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
                 if (messageCarouselIsChannel) {
                     graphics::menuHandler::openChatActionsForChannel(messageCarouselChannel);
                 } else {
@@ -3196,7 +3196,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
 
         if (isSelect || key == 13) { // ENTER key - open chat menu
                                      // Open chat menu for the current conversation
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
             if (messageCarouselIsChannel) {
                 graphics::menuHandler::openChatActionsForChannel(messageCarouselChannel);
             } else {
@@ -3209,7 +3209,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
         // Handle user button press - same as SELECT
         if (event->inputEvent == INPUT_BROKER_USER_PRESS) {
             // Open chat menu for the current conversation
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
             if (messageCarouselIsChannel) {
                 graphics::menuHandler::openChatActionsForChannel(messageCarouselChannel);
             } else {
@@ -3491,7 +3491,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
 
 #endif // !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
 
-#if defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && !defined(CHAT_MEMORY_ONLY)
     // Stub implementations for memory-constrained devices
     void CannedMessageModule::refreshCarouselIfActive()
     {
@@ -3508,4 +3508,4 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
         // Do nothing - no carousel support in memory-constrained build
         return 0;
     }
-#endif // defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#endif // defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && !defined(CHAT_MEMORY_ONLY)

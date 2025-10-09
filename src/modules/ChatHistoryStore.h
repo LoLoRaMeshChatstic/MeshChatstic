@@ -2,8 +2,13 @@
 
 #include "configuration.h"
 
-// Only enable full chat history on devices with sufficient memory
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && HAS_SCREEN
+// Three chat modes:
+// 1. Full mode: Unlimited history + file persistence (ESP32/devices with lots of Flash)
+// 2. Memory-only mode: Limited history in RAM only (nRF52/RP2040 with sufficient RAM)
+// 3. Minimal mode: Only last message per conversation (very constrained devices)
+
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && !defined(CHAT_MEMORY_ONLY) && HAS_SCREEN
+// === MODE 1: FULL CHAT HISTORY WITH PERSISTENCE ===
 
 #include <deque>
 #include <map>
@@ -97,8 +102,100 @@ class ChatHistoryStore
 
 } // namespace chat
 
+#elif defined(CHAT_MEMORY_ONLY) && HAS_SCREEN
+// === MODE 2: MEMORY-ONLY CHAT HISTORY (LIMITED) ===
+// Keeps limited history in RAM only - perfect for nRF52/RP2040
+// Provides carousel functionality without Flash usage
+
+#include <deque>
+#include <map>
+#include <stdint.h>
+#include <string>
+#include <vector>
+
+namespace chat
+{
+
+struct ChatEntry {
+    uint32_t ts;      // timestamp
+    bool outgoing;    // true if sent by us
+    bool isChannel;   // true for channel, false for DM
+    bool unread;      // true if not read yet
+    uint32_t node;    // sender node (for alias display); 0 if it's us and doesn't matter
+    uint8_t channel;  // channel index (only for channel messages)
+    std::string text; // message content
+
+    // No serialization needed for memory-only mode
+    static std::string serialize(const ChatEntry &) { return ""; }
+    static ChatEntry deserialize(const std::string &) { return ChatEntry(); }
+};
+
+class ChatHistoryStore
+{
+  public:
+    static ChatHistoryStore &instance()
+    {
+        static ChatHistoryStore inst;
+        return inst;
+    }
+
+    // Add messages (limited to kMaxPerGroup per conversation)
+    void addDM(uint32_t peer, bool outgoing, const std::string &text, uint32_t ts, bool unread = true);
+    void addCHAN(uint8_t channel, uint32_t fromNode, bool outgoing, const std::string &text, uint32_t ts, bool unread = true);
+
+    // Full access to history (limited but functional)
+    const std::deque<ChatEntry> &getDM(uint32_t peer) const;
+    const std::deque<ChatEntry> &getCHAN(uint8_t channel) const;
+
+    // Management
+    void clearDM(uint32_t peer);
+    void clearCHAN(uint8_t channel);
+    void removeByNode(uint32_t peer) { clearDM(peer); }
+    void removeChannel(uint8_t channel) { clearCHAN(channel); }
+    void clearChatHistoryDM(uint32_t peer) { clearDM(peer); }
+    void clearChatHistoryChannel(uint8_t channel) { clearCHAN(channel); }
+
+    // Unread management
+    int getUnreadCountDM(uint32_t peer) const;
+    int getUnreadCountCHAN(uint8_t channel) const;
+    void markAsReadDM(uint32_t peer);
+    void markAsReadCHAN(uint8_t channel);
+    void markMessageAsRead(uint32_t peer, int index);
+    void markChannelMessageAsRead(uint8_t channel, int index);
+    void markMessageAsReadDM(uint32_t peer, uint32_t timestamp);
+    void markMessageAsReadCHAN(uint8_t channel, uint32_t timestamp);
+    void initializeUnreadCounters() {}
+    int getFirstUnreadIndexDM(uint32_t peer) const;
+    int getFirstUnreadIndexCHAN(uint8_t channel) const;
+    int getLastReadIndexDM(uint32_t peer) const { return -1; }
+    int getLastReadIndexCHAN(uint8_t channel) const { return -1; }
+
+    // Discovery
+    std::vector<uint32_t> listDMPeers() const;
+    std::vector<uint8_t> listChannels() const;
+
+    // No-op persistence (memory-only mode)
+    void saveAll() {}
+    void loadAll() {}
+
+  private:
+    ChatHistoryStore() = default;
+    static void pushBounded(std::deque<ChatEntry> &q, ChatEntry e);
+
+    static constexpr size_t kMaxPerGroup = 30; // Limited messages per conversation for RAM efficiency
+    
+    std::map<uint32_t, std::deque<ChatEntry>> dm_; // DM conversations (limited)
+    std::map<uint8_t, std::deque<ChatEntry>> ch_;  // Channel conversations (limited)
+    
+    // Empty deque for non-existent conversations
+    static const std::deque<ChatEntry> kEmptyDeque;
+};
+
+} // namespace chat
+
 #else
-// Lightweight chat stub for memory-constrained devices (nRF52, RP2040)
+// === MODE 3: MINIMAL CHAT (LAST MESSAGE ONLY) ===
+// Lightweight chat stub for very memory-constrained devices
 // Provides basic chat functionality without persistent history or carousel
 #include <deque>
 #include <map>

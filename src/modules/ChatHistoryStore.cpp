@@ -1,7 +1,7 @@
 #include "modules/ChatHistoryStore.h"
 
 // Full implementation for devices with sufficient memory
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && HAS_SCREEN
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) && !defined(CHAT_MEMORY_ONLY) && HAS_SCREEN
 
 #include "FSCommon.h"
 #include <algorithm>
@@ -611,8 +611,234 @@ void ChatHistoryStore::markMessageAsReadCHAN(uint8_t channel, uint32_t timestamp
 
 } // namespace chat
 
+#elif defined(CHAT_MEMORY_ONLY) && HAS_SCREEN
+// === MODE 2: MEMORY-ONLY IMPLEMENTATION ===
+// Limited history in RAM only - no file persistence
+#include <algorithm>
+
+namespace chat
+{
+
+const std::deque<ChatEntry> ChatHistoryStore::kEmptyDeque;
+
+ChatHistoryStore &ChatHistoryStore::instance()
+{
+    static ChatHistoryStore inst;
+    return inst;
+}
+
+void ChatHistoryStore::pushBounded(std::deque<ChatEntry> &q, ChatEntry e)
+{
+    // Insert in chronological order (ascending timestamp)
+    if (q.empty() || q.back().ts <= e.ts) {
+        q.push_back(std::move(e));
+    } else {
+        auto it = std::upper_bound(q.begin(), q.end(), e.ts, [](uint32_t t, const ChatEntry &ce) { return t < ce.ts; });
+        q.insert(it, std::move(e));
+    }
+    // Enforce limit for memory efficiency
+    while (q.size() > kMaxPerGroup)
+        q.pop_front();
+}
+
+void ChatHistoryStore::addDM(uint32_t peer, bool outgoing, const std::string &text, uint32_t ts, bool unread)
+{
+    ChatEntry e;
+    e.ts = ts;
+    e.outgoing = outgoing;
+    e.isChannel = false;
+    e.unread = unread && !outgoing; // Only incoming messages can be unread
+    e.node = peer;                  // sender (for alias display); 0 if it's us and doesn't matter
+    e.channel = 0;
+    e.text = text;
+    pushBounded(dm_[peer], std::move(e));
+    // No persistence in memory-only mode
+}
+
+void ChatHistoryStore::addCHAN(uint8_t channel, uint32_t fromNode, bool outgoing, const std::string &text, uint32_t ts,
+                               bool unread)
+{
+    ChatEntry e;
+    e.ts = ts;
+    e.outgoing = outgoing;
+    e.isChannel = true;
+    e.unread = unread && !outgoing; // Only incoming messages can be unread
+    e.node = fromNode;              // sender (for alias display); 0 if it's us and doesn't matter
+    e.channel = channel;
+    e.text = text;
+    pushBounded(ch_[channel], std::move(e));
+    // No persistence in memory-only mode
+}
+
+const std::deque<ChatEntry> &ChatHistoryStore::getDM(uint32_t peer) const
+{
+    auto it = dm_.find(peer);
+    return (it != dm_.end()) ? it->second : kEmptyDeque;
+}
+
+const std::deque<ChatEntry> &ChatHistoryStore::getCHAN(uint8_t channel) const
+{
+    auto it = ch_.find(channel);
+    return (it != ch_.end()) ? it->second : kEmptyDeque;
+}
+
+void ChatHistoryStore::clearDM(uint32_t peer)
+{
+    dm_.erase(peer);
+}
+
+void ChatHistoryStore::clearCHAN(uint8_t channel)
+{
+    ch_.erase(channel);
+}
+
+std::vector<uint32_t> ChatHistoryStore::listDMPeers() const
+{
+    std::vector<uint32_t> v;
+    v.reserve(dm_.size());
+    for (auto &kv : dm_)
+        v.push_back(kv.first);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+std::vector<uint8_t> ChatHistoryStore::listChannels() const
+{
+    std::vector<uint8_t> v;
+    v.reserve(ch_.size());
+    for (auto &kv : ch_)
+        v.push_back(kv.first);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+int ChatHistoryStore::getUnreadCountDM(uint32_t peer) const
+{
+    auto it = dm_.find(peer);
+    if (it == dm_.end())
+        return 0;
+    
+    int count = 0;
+    for (const auto &entry : it->second) {
+        if (entry.unread)
+            count++;
+    }
+    return count;
+}
+
+int ChatHistoryStore::getUnreadCountCHAN(uint8_t channel) const
+{
+    auto it = ch_.find(channel);
+    if (it == ch_.end())
+        return 0;
+    
+    int count = 0;
+    for (const auto &entry : it->second) {
+        if (entry.unread)
+            count++;
+    }
+    return count;
+}
+
+void ChatHistoryStore::markAsReadDM(uint32_t peer)
+{
+    auto it = dm_.find(peer);
+    if (it == dm_.end())
+        return;
+    
+    for (auto &entry : it->second) {
+        entry.unread = false;
+    }
+}
+
+void ChatHistoryStore::markAsReadCHAN(uint8_t channel)
+{
+    auto it = ch_.find(channel);
+    if (it == ch_.end())
+        return;
+    
+    for (auto &entry : it->second) {
+        entry.unread = false;
+    }
+}
+
+void ChatHistoryStore::markMessageAsRead(uint32_t peer, int index)
+{
+    auto it = dm_.find(peer);
+    if (it == dm_.end() || index < 0 || index >= (int)it->second.size())
+        return;
+    
+    it->second[index].unread = false;
+}
+
+void ChatHistoryStore::markChannelMessageAsRead(uint8_t channel, int index)
+{
+    auto it = ch_.find(channel);
+    if (it == ch_.end() || index < 0 || index >= (int)it->second.size())
+        return;
+    
+    it->second[index].unread = false;
+}
+
+void ChatHistoryStore::markMessageAsReadDM(uint32_t peer, uint32_t timestamp)
+{
+    auto it = dm_.find(peer);
+    if (it == dm_.end())
+        return;
+    
+    for (auto &entry : it->second) {
+        if (entry.ts == timestamp) {
+            entry.unread = false;
+            break;
+        }
+    }
+}
+
+void ChatHistoryStore::markMessageAsReadCHAN(uint8_t channel, uint32_t timestamp)
+{
+    auto it = ch_.find(channel);
+    if (it == ch_.end())
+        return;
+    
+    for (auto &entry : it->second) {
+        if (entry.ts == timestamp) {
+            entry.unread = false;
+            break;
+        }
+    }
+}
+
+int ChatHistoryStore::getFirstUnreadIndexDM(uint32_t peer) const
+{
+    auto it = dm_.find(peer);
+    if (it == dm_.end())
+        return -1;
+    
+    for (int i = 0; i < (int)it->second.size(); i++) {
+        if (it->second[i].unread)
+            return i;
+    }
+    return -1;
+}
+
+int ChatHistoryStore::getFirstUnreadIndexCHAN(uint8_t channel) const
+{
+    auto it = ch_.find(channel);
+    if (it == ch_.end())
+        return -1;
+    
+    for (int i = 0; i < (int)it->second.size(); i++) {
+        if (it->second[i].unread)
+            return i;
+    }
+    return -1;
+}
+
+} // namespace chat
+
 #else
-// Lightweight implementation for memory-constrained devices (nRF52, RP2040)
+// === MODE 3: MINIMAL IMPLEMENTATION ===
+// Lightweight implementation for very memory-constrained devices (nRF52, RP2040)
 #include <algorithm>
 
 namespace chat
@@ -799,4 +1025,4 @@ std::vector<uint8_t> ChatHistoryStore::listChannels() const
 
 } // namespace chat
 
-#endif // MESHTASTIC_EXCLUDE_CHAT_HISTORY
+#endif // Chat history modes
