@@ -102,6 +102,9 @@ void ChatHistoryStore::pushBounded(std::deque<ChatEntry> &q, ChatEntry e)
 
 void ChatHistoryStore::addDM(uint32_t peer, bool outgoing, const std::string &text, uint32_t ts, bool unread)
 {
+    // Ensure historical data is loaded before adding new message
+    loadDM(peer);
+    
     ChatEntry e;
     e.ts = ts;
     e.outgoing = outgoing;
@@ -117,6 +120,9 @@ void ChatHistoryStore::addDM(uint32_t peer, bool outgoing, const std::string &te
 void ChatHistoryStore::addCHAN(uint8_t channel, uint32_t fromNode, bool outgoing, const std::string &text, uint32_t ts,
                                bool unread)
 {
+    // Ensure historical data is loaded before adding new message
+    loadCHAN(channel);
+    
     ChatEntry e;
     e.ts = ts;
     e.outgoing = outgoing;
@@ -131,8 +137,7 @@ void ChatHistoryStore::addCHAN(uint8_t channel, uint32_t fromNode, bool outgoing
 // --- Persistence ---
 void ChatHistoryStore::saveDM(uint32_t peer)
 {
-    std::string filename = "/prefs/chat_dm_" + std::to_string(peer) + ".csv";
-    // Remove the file first to ensure truncation
+    std::string filename = "/chat_dm_" + std::to_string(peer) + ".txt";
     FSCom.remove(filename.c_str());
     auto f = FSCom.open(filename.c_str(), FILE_O_WRITE);
     if (!f)
@@ -150,7 +155,7 @@ void ChatHistoryStore::loadDM(uint32_t peer)
         return;
     }
     
-    std::string filename = "/prefs/chat_dm_" + std::to_string(peer) + ".csv";
+    std::string filename = "/chat_dm_" + std::to_string(peer) + ".txt";
     auto f = FSCom.open(filename.c_str(), FILE_O_READ);
     if (!f)
         return; // Archivo no existe, sin error
@@ -184,8 +189,7 @@ void ChatHistoryStore::loadDM(uint32_t peer)
 
 void ChatHistoryStore::saveCHAN(uint8_t channel)
 {
-    std::string filename = "/prefs/chat_ch_" + std::to_string(channel) + ".csv";
-    // Remove the file first to ensure truncation
+    std::string filename = "/chat_ch_" + std::to_string(channel) + ".txt";
     FSCom.remove(filename.c_str());
     auto f = FSCom.open(filename.c_str(), FILE_O_WRITE);
     if (!f)
@@ -203,7 +207,7 @@ void ChatHistoryStore::loadCHAN(uint8_t channel)
         return;
     }
     
-    std::string filename = "/prefs/chat_ch_" + std::to_string(channel) + ".csv";
+    std::string filename = "/chat_ch_" + std::to_string(channel) + ".txt";
     auto f = FSCom.open(filename.c_str(), FILE_O_READ);
     if (!f)
         return; // Archivo no existe, sin error
@@ -333,7 +337,7 @@ void ChatHistoryStore::clearChatHistoryDM(uint32_t peer)
     // Eliminar de RAM
     dm_.erase(peer);
 
-    // Eliminar archivo persistente
+    // Eliminar archivo persistente (mismo formato que save/load)
     std::string filename = "/chat_dm_" + std::to_string(peer) + ".txt";
     FSCom.remove(filename.c_str());
 }
@@ -343,7 +347,7 @@ void ChatHistoryStore::clearChatHistoryChannel(uint8_t channel)
     // Eliminar de RAM
     ch_.erase(channel);
 
-    // Eliminar archivo persistente
+    // Eliminar archivo persistente (mismo formato que save/load)
     std::string filename = "/chat_ch_" + std::to_string(channel) + ".txt";
     FSCom.remove(filename.c_str());
 }
