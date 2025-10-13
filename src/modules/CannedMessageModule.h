@@ -201,6 +201,7 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
     unsigned long lastUpdateMillis = 0;
     String searchQuery;
     String freetext;
+    int freetextScrollOffset = 0; // Scroll offset for freetext input (line-based)
     String temporaryMessage;
 
     // === Message Storage ===

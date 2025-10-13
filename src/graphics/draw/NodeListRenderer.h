@@ -54,6 +54,11 @@ const char *getCurrentModeTitle(int screenWidth);
 const char *getSafeNodeName(meshtastic_NodeInfoLite *node);
 void drawColumns(OLEDDisplay *display, int16_t x, int16_t y, const char **fields);
 
+// NodeList scroll management
+void scrollUp();
+void scrollDown();
+int getScrollIndex();
+
 // Bitmap drawing function
 void drawScaledXBitmap16x16(int x, int y, int width, int height, const uint8_t *bitmapXBM, OLEDDisplay *display);
 

@@ -158,8 +158,10 @@ class ChatHistoryStore
     // Unread management
     int getUnreadCountDM(uint32_t peer) const;
     int getUnreadCountCHAN(uint8_t channel) const;
+    int getTotalUnreadCount() const;
     void markAsReadDM(uint32_t peer);
     void markAsReadCHAN(uint8_t channel);
+    void markAllAsRead();
     void markMessageAsRead(uint32_t peer, int index);
     void markChannelMessageAsRead(uint8_t channel, int index);
     void markMessageAsReadDM(uint32_t peer, uint32_t timestamp);
@@ -167,8 +169,8 @@ class ChatHistoryStore
     void initializeUnreadCounters() {}
     int getFirstUnreadIndexDM(uint32_t peer) const;
     int getFirstUnreadIndexCHAN(uint8_t channel) const;
-    int getLastReadIndexDM(uint32_t peer) const { return -1; }
-    int getLastReadIndexCHAN(uint8_t channel) const { return -1; }
+    int getLastReadIndexDM(uint32_t peer) const;
+    int getLastReadIndexCHAN(uint8_t channel) const;
 
     // Discovery
     std::vector<uint32_t> listDMPeers() const;

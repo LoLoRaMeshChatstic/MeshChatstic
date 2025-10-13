@@ -380,9 +380,8 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
             }
             resetBanner();
             return;
-        } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG ||
-                    (inEvent.inputEvent == INPUT_BROKER_ANYKEY && (inEvent.kbchar == 27 || inEvent.kbchar == 'q'))) &&
-                   alertBannerUntil != 0) {
+    } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG ||
+            (inEvent.inputEvent == INPUT_BROKER_ANYKEY && (inEvent.kbchar == 27 || inEvent.kbchar == 'q')))) {
             // Handle ESC key - look for "Back" option and call callback with that value
             // ESC can come as: INPUT_BROKER_CANCEL (CardKB with sym+q) or INPUT_BROKER_ANYKEY with kbchar=27 (ASCII ESC) or
             // kbchar='q' (CardKB without sym)

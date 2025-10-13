@@ -775,9 +775,9 @@ void menuHandler::messageResponseMenu()
             }
         } else if (selected == Emote) {
             if (devicestate.rx_text_message.to == NODENUM_BROADCAST) {
-                cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST, devicestate.rx_text_message.channel);
+                cannedMessageModule->LaunchEmotePickerWithDestination(NODENUM_BROADCAST, devicestate.rx_text_message.channel);
             } else {
-                cannedMessageModule->LaunchEmoteWithDestination(devicestate.rx_text_message.from);
+                cannedMessageModule->LaunchEmotePickerWithDestination(devicestate.rx_text_message.from);
             }
         }
 #ifdef HAS_I2S
@@ -826,10 +826,9 @@ void menuHandler::homeBaseMenu()
     // Always add emote option since it works without keyboard
     optionsArray[options] = "New Emote Msg";
 #if defined(M5STACK_UNITC6L)
+    BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Home";
 #else
-    optionsEnumArray[options++] = Emote;
-
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Home Action";
 #endif
@@ -868,7 +867,7 @@ void menuHandler::homeBaseMenu()
         } else if (selected == Freetext) {
             cannedMessageModule->LaunchFreetextWithDestination(NODENUM_BROADCAST);
         } else if (selected == Emote) {
-            cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST);
+            cannedMessageModule->LaunchEmotePickerWithDestination(NODENUM_BROADCAST);
         }
     };
     screen->showOverlayBanner(bannerOptions);
@@ -899,7 +898,7 @@ void menuHandler::textMessageBaseMenu()
     bannerOptions.bannerCallback = [](int selected) -> void {
         if (selected == Preset) {
         } else if (selected == Emote) {
-            cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST);
+            cannedMessageModule->LaunchEmotePickerWithDestination(NODENUM_BROADCAST);
         } else if (selected == Freetext) {
             cannedMessageModule->LaunchFreetextWithDestination(NODENUM_BROADCAST);
         }
@@ -1028,7 +1027,7 @@ void menuHandler::favoriteBaseMenu()
         } else if (selected == Freetext) {
             cannedMessageModule->LaunchFreetextWithDestination(graphics::UIRenderer::currentFavoriteNodeNum);
         } else if (selected == Emote) {
-            cannedMessageModule->LaunchEmoteWithDestination(graphics::UIRenderer::currentFavoriteNodeNum);
+            cannedMessageModule->LaunchEmotePickerWithDestination(graphics::UIRenderer::currentFavoriteNodeNum);
         } else if (selected == Remove) {
             menuHandler::menuQueue = menuHandler::remove_favorite;
             screen->runNow();
@@ -2475,7 +2474,7 @@ void menuHandler::sleepTimerConfig()
 
 void menuHandler::openChatActionsForNode(uint32_t nodeId)
 {
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
     // Dynamic options (max 9 visible here)
     enum {
         kPreset = 1,
@@ -2574,7 +2573,7 @@ void menuHandler::openChatActionsForNode(uint32_t nodeId)
 
         case kEmote:
             if (cannedMessageModule)
-                cannedMessageModule->LaunchEmoteWithDestination(nodeId);
+                cannedMessageModule->LaunchEmotePickerWithDestination(nodeId);
             break;
 
         case kRemove:
@@ -2674,12 +2673,12 @@ void menuHandler::openChatActionsForNode(uint32_t nodeId)
     if (cannedMessageModule) {
         cannedMessageModule->LaunchWithDestination(nodeId);
     }
-#endif // !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#endif // !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
 }
 
 void menuHandler::openChatActionsForChannel(uint8_t ch)
 {
-#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY)
+#if !defined(MESHTASTIC_EXCLUDE_CHAT_HISTORY) || defined(CHAT_MEMORY_ONLY)
     enum { kPreset = 1, kFree = 2, kEmote = 3, kRemove = 4, kMarkRead = 5, kScrollType = 6, kBack = 7, kExit = 8 };
 
     static const char *opts[8];
@@ -2754,9 +2753,9 @@ void menuHandler::openChatActionsForChannel(uint8_t ch)
         const char *cname2 = (cc.settings.name[0]) ? cc.settings.name : nullptr;
         char hdr[64];
         if (cname2)
-            snprintf(hdr, sizeof(hdr), "To: %s", cname2);
+            snprintf(hdr, sizeof(hdr), "%s", cname2);
         else
-            snprintf(hdr, sizeof(hdr), "To: Channel %u", (unsigned)ch);
+            snprintf(hdr, sizeof(hdr), "Channel %u", (unsigned)ch);
         g_pendingKeyboardHeader = hdr;
 
         // Ensure channel is active and marked as favorite-tab
@@ -2774,7 +2773,7 @@ void menuHandler::openChatActionsForChannel(uint8_t ch)
             break;
         case kEmote:
             if (cannedMessageModule)
-                cannedMessageModule->LaunchEmoteWithDestination(NODENUM_BROADCAST, ch);
+                cannedMessageModule->LaunchEmotePickerWithDestination(NODENUM_BROADCAST, ch);
             break;
         case kRemove:
             // Remove chat history but maintain channel and frame (RAM + persistent)

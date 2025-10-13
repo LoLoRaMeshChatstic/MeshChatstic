@@ -750,6 +750,7 @@ void Power::shutdown()
         screen->showSimpleBanner("Device is powered off.\nConnect USB to start!", 0); // T-Deck Pro has no power button
 #else
         screen->showSimpleBanner("Shutting Down...", 0); // stays on screen
+        delay(1500); // Dar tiempo para que se vea el banner antes de apagar
 #endif
     }
 #endif

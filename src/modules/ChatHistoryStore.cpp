@@ -621,12 +621,6 @@ namespace chat
 
 const std::deque<ChatEntry> ChatHistoryStore::kEmptyDeque;
 
-ChatHistoryStore &ChatHistoryStore::instance()
-{
-    static ChatHistoryStore inst;
-    return inst;
-}
-
 void ChatHistoryStore::pushBounded(std::deque<ChatEntry> &q, ChatEntry e)
 {
     // Insert in chronological order (ascending timestamp)
@@ -740,6 +734,29 @@ int ChatHistoryStore::getUnreadCountCHAN(uint8_t channel) const
     return count;
 }
 
+int ChatHistoryStore::getTotalUnreadCount() const
+{
+    int total = 0;
+    
+    // Count unread from all DMs
+    for (const auto &kv : dm_) {
+        for (const auto &entry : kv.second) {
+            if (entry.unread)
+                total++;
+        }
+    }
+    
+    // Count unread from all channels
+    for (const auto &kv : ch_) {
+        for (const auto &entry : kv.second) {
+            if (entry.unread)
+                total++;
+        }
+    }
+    
+    return total;
+}
+
 void ChatHistoryStore::markAsReadDM(uint32_t peer)
 {
     auto it = dm_.find(peer);
@@ -759,6 +776,23 @@ void ChatHistoryStore::markAsReadCHAN(uint8_t channel)
     
     for (auto &entry : it->second) {
         entry.unread = false;
+    }
+}
+
+void ChatHistoryStore::markAllAsRead()
+{
+    // Mark all DMs as read
+    for (auto &kv : dm_) {
+        for (auto &entry : kv.second) {
+            entry.unread = false;
+        }
+    }
+    
+    // Mark all channels as read
+    for (auto &kv : ch_) {
+        for (auto &entry : kv.second) {
+            entry.unread = false;
+        }
     }
 }
 
@@ -832,6 +866,34 @@ int ChatHistoryStore::getFirstUnreadIndexCHAN(uint8_t channel) const
             return i;
     }
     return -1;
+}
+
+int ChatHistoryStore::getLastReadIndexDM(uint32_t peer) const
+{
+    auto it = dm_.find(peer);
+    if (it == dm_.end())
+        return -1;
+    
+    // Find last read message from oldest to newest
+    for (int i = (int)it->second.size() - 1; i >= 0; --i) {
+        if (!it->second[i].unread)
+            return i;
+    }
+    return -1; // No messages are read
+}
+
+int ChatHistoryStore::getLastReadIndexCHAN(uint8_t channel) const
+{
+    auto it = ch_.find(channel);
+    if (it == ch_.end())
+        return -1;
+    
+    // Find last read message from oldest to newest
+    for (int i = (int)it->second.size() - 1; i >= 0; --i) {
+        if (!it->second[i].unread)
+            return i;
+    }
+    return -1; // No messages are read
 }
 
 } // namespace chat

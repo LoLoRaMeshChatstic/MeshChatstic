@@ -48,6 +48,10 @@ void drawScaledXBitmap16x16(int x, int y, int width, int height, const uint8_t *
 // Static variables for dynamic cycling
 static NodeListMode currentMode = MODE_LAST_HEARD;
 static int scrollIndex = 0;
+// Variables to pause auto-cycling when user is scrolling
+static bool userScrolling = false;
+static unsigned long lastScrollTime = 0;
+static const unsigned long SCROLL_PAUSE_DURATION_MS = 3000; // 3 seconds pause after scroll
 
 // =============================
 // Utility Functions
@@ -94,6 +98,52 @@ const char *getCurrentModeTitle(int screenWidth)
     default:
         return "Nodes";
     }
+}
+
+// Scroll management functions for NodeList frames
+void scrollUp()
+{
+    if (scrollIndex > 0) {
+        scrollIndex--;
+        // Mark user interaction to pause auto-cycling
+        userScrolling = true;
+        lastScrollTime = millis();
+    }
+}
+
+void scrollDown()
+{
+    int totalEntries = nodeDB->getNumMeshNodes();
+    if (totalEntries == 0) return;
+    /* trunk-ignore(git-diff-check/error) */
+
+    // Calculate visible entries based on display configuration
+    // This matches the calculation in drawNodeListScreen
+    const int COMMON_HEADER_HEIGHT = FONT_HEIGHT_SMALL - 1;
+    const int rowYOffset = FONT_HEIGHT_SMALL - 3;
+    int displayHeight = 64; // Standard OLED height for ST7920/SSD1306
+    int totalRowsAvailable = (displayHeight - COMMON_HEADER_HEIGHT) / rowYOffset;
+
+#if defined(M5STACK_UNITC6L)
+    int totalColumns = 1;
+#else
+    int totalColumns = 2;
+#endif
+
+    int entriesPerPage = totalRowsAvailable * totalColumns;
+    int maxScrollIndex = (totalEntries > entriesPerPage) ? ((totalEntries - entriesPerPage) / entriesPerPage) : 0;
+
+    if (scrollIndex < maxScrollIndex) {
+        scrollIndex++;
+        // Mark user interaction to pause auto-cycling
+        userScrolling = true;
+        lastScrollTime = millis();
+    }
+}
+
+int getScrollIndex()
+{
+    return scrollIndex;
 }
 
 // Use dynamic timing based on mode
@@ -492,10 +542,17 @@ void drawDynamicNodeListScreen(OLEDDisplay *display, OLEDDisplayUiState *state, 
         modeStartTime = now;
     }
 
-    // Time to switch to next mode?
-    if (now - modeStartTime >= getModeCycleIntervalMs()) {
+    // Check if user scroll pause has expired
+    if (userScrolling && (now - lastScrollTime > SCROLL_PAUSE_DURATION_MS)) {
+        userScrolling = false; // Resume auto-cycling
+    }
+
+    // Time to switch to next mode? (only if user is NOT scrolling)
+    if (!userScrolling && (now - modeStartTime >= getModeCycleIntervalMs())) {
         currentMode = static_cast<NodeListMode>((currentMode + 1) % MODE_COUNT);
         modeStartTime = now;
+        // Reset scroll when auto-cycling changes mode
+        scrollIndex = 0;
     }
 
     // Render screen based on currentMode

@@ -2,6 +2,8 @@
 #include "configuration.h"
 #include "detect/ScanI2C.h"
 #include "detect/ScanI2CTwoWire.h"
+// Access to power status to gate keyboard events under low voltage
+#include "PowerStatus.h"
 
 #if defined(T_DECK_PRO)
 #include "TDeckProKeyboard.h"
@@ -26,6 +28,15 @@ KbI2cBase::KbI2cBase(const char *name)
 {
     this->_originName = name;
 }
+
+// Debounce / low-voltage gating for CardKB events
+// static helpers at file scope
+static uint32_t _kb_last_notify_ms = 0;
+static const uint32_t KB_DEBOUNCE_MS = 50;      // ignore events within 50ms
+static const uint32_t KB_LOWV_NOTIFY_MS = 1000; // when low V, allow only one event per second
+static const int KB_BATTERY_PCT_THRESHOLD = 8;   // below this percent, apply low-V gating
+static const int KB_BATTERY_MV_THRESHOLD = 3200; // or below this mV
+
 
 uint8_t read_from_14004(TwoWire *i2cBus, uint8_t reg, uint8_t *data, uint8_t length)
 {
@@ -179,7 +190,31 @@ int32_t KbI2cBase::runOnce()
                 }
 
                 if (e.inputEvent != INPUT_BROKER_NONE) {
-                    this->notifyObservers(&e);
+                    // Gate events by debounce and low-voltage conditions
+                    bool allow = true;
+                    uint32_t now = millis();
+                    // If too close to last notify, debounce
+                    if (now - _kb_last_notify_ms < KB_DEBOUNCE_MS) {
+                        allow = false;
+                    }
+                    // Check battery status if available
+                    if (allow && powerStatus) {
+                        int pct = powerStatus->getBatteryChargePercent();
+                        int mv = powerStatus->getBatteryVoltageMv();
+                        if ((pct >= 0 && pct < KB_BATTERY_PCT_THRESHOLD) || (mv > 0 && mv < KB_BATTERY_MV_THRESHOLD)) {
+                            // low-voltage: only allow one event per KB_LOWV_NOTIFY_MS
+                            if (now - _kb_last_notify_ms < KB_LOWV_NOTIFY_MS) {
+                                allow = false;
+                            }
+                        }
+                    }
+
+                    if (allow) {
+                        _kb_last_notify_ms = now;
+                        this->notifyObservers(&e);
+                    } else {
+                        LOG_DEBUG("CardKB: event suppressed (debounce/lowV). evt=%d char=%d", e.inputEvent, e.kbchar);
+                    }
                 }
             }
         }
@@ -243,7 +278,22 @@ int32_t KbI2cBase::runOnce()
             }
             if (e.inputEvent != INPUT_BROKER_NONE) {
                 LOG_DEBUG("MP121 Notifying: %i Char: %i", e.inputEvent, e.kbchar);
-                this->notifyObservers(&e);
+                bool allow = true;
+                uint32_t now = millis();
+                if (now - _kb_last_notify_ms < KB_DEBOUNCE_MS) allow = false;
+                if (allow && powerStatus) {
+                    int pct = powerStatus->getBatteryChargePercent();
+                    int mv = powerStatus->getBatteryVoltageMv();
+                    if ((pct >= 0 && pct < KB_BATTERY_PCT_THRESHOLD) || (mv > 0 && mv < KB_BATTERY_MV_THRESHOLD)) {
+                        if (now - _kb_last_notify_ms < KB_LOWV_NOTIFY_MS) allow = false;
+                    }
+                }
+                if (allow) {
+                    _kb_last_notify_ms = now;
+                    this->notifyObservers(&e);
+                } else {
+                    LOG_DEBUG("MP121: event suppressed (debounce/lowV). evt=%d char=%d", e.inputEvent, e.kbchar);
+                }
             }
         }
         break;
@@ -329,7 +379,22 @@ int32_t KbI2cBase::runOnce()
             }
             if (e.inputEvent != INPUT_BROKER_NONE) {
                 LOG_DEBUG("TCA8418 Notifying: %i Char: %c", e.inputEvent, e.kbchar);
-                this->notifyObservers(&e);
+                bool allow = true;
+                uint32_t now = millis();
+                if (now - _kb_last_notify_ms < KB_DEBOUNCE_MS) allow = false;
+                if (allow && powerStatus) {
+                    int pct = powerStatus->getBatteryChargePercent();
+                    int mv = powerStatus->getBatteryVoltageMv();
+                    if ((pct >= 0 && pct < KB_BATTERY_PCT_THRESHOLD) || (mv > 0 && mv < KB_BATTERY_MV_THRESHOLD)) {
+                        if (now - _kb_last_notify_ms < KB_LOWV_NOTIFY_MS) allow = false;
+                    }
+                }
+                if (allow) {
+                    _kb_last_notify_ms = now;
+                    this->notifyObservers(&e);
+                } else {
+                    LOG_DEBUG("TCA8418: event suppressed (debounce/lowV). evt=%d char=%d", e.inputEvent, e.kbchar);
+                }
             }
             TCAKeyboard.trigger();
         }
@@ -355,7 +420,24 @@ int32_t KbI2cBase::runOnce()
             e.inputEvent = INPUT_BROKER_MATRIXKEY;
             e.source = this->_originName;
             e.kbchar = PrintDataBuf;
-            this->notifyObservers(&e);
+            {
+                bool allow = true;
+                uint32_t now = millis();
+                if (now - _kb_last_notify_ms < KB_DEBOUNCE_MS) allow = false;
+                if (allow && powerStatus) {
+                    int pct = powerStatus->getBatteryChargePercent();
+                    int mv = powerStatus->getBatteryVoltageMv();
+                    if ((pct >= 0 && pct < KB_BATTERY_PCT_THRESHOLD) || (mv > 0 && mv < KB_BATTERY_MV_THRESHOLD)) {
+                        if (now - _kb_last_notify_ms < KB_LOWV_NOTIFY_MS) allow = false;
+                    }
+                }
+                if (allow) {
+                    _kb_last_notify_ms = now;
+                    this->notifyObservers(&e);
+                } else {
+                    LOG_DEBUG("RAK14004: event suppressed (debounce/lowV). evt=%d char=%d", e.inputEvent, e.kbchar);
+                }
+            }
         }
         break;
     }
@@ -483,15 +565,51 @@ int32_t KbI2cBase::runOnce()
                 break;
 
             case 0x90: // fn+r      INPUT_BROKER_MSG_REBOOT
-            case 0x91: // fn+t
+                e.inputEvent = INPUT_BROKER_ANYKEY;
+                e.kbchar = INPUT_BROKER_MSG_REBOOT;
+                break;
+            case 0x91: // fn+t      (sin asignar actualmente)
+                // Tecla reservada para futura funcionalidad
+                e.inputEvent = INPUT_BROKER_NONE;
+                break;
             case 0xac: // fn+m      INPUT_BROKER_MSG_MUTE_TOGGLE
 
-            case 0x8b: // fn+del    INPUT_BROKEN_MSG_DISMISS_FRAME
+            case 0x8b: // fn+del    WiFi scan (repurposed from dismiss frame)
+                e.inputEvent = INPUT_BROKER_ANYKEY;
+                e.kbchar = INPUT_BROKER_MSG_WIFI_SCAN;
+                break;
             case 0xAA: // fn+b      INPUT_BROKER_MSG_BLUETOOTH_TOGGLE
             case 0x8F: // fn+e      INPUT_BROKER_MSG_EMOTE_LIST
                 // just pass those unmodified
                 e.inputEvent = INPUT_BROKER_ANYKEY;
                 e.kbchar = c;
+                break;
+            // Spanish character mappings using modifier system
+            case 0x8A: // fn+0 combination - convert to Ñ
+                LOG_DEBUG("CardKB: fn+0 pressed, sending Ñ (0xD1)");
+                e.inputEvent = INPUT_BROKER_ANYKEY;
+                e.kbchar = 0xD1; // Ñ character code (same as virtual keyboard)
+                break;
+            case 0xAB: // fn+n combination - convert to ñ
+                LOG_DEBUG("CardKB: fn+n pressed, sending ñ (0xF1)");
+                e.inputEvent = INPUT_BROKER_ANYKEY;
+                e.kbchar = 0xF1; // ñ character code (same as virtual keyboard)
+                break;
+            case 0x8E: // fn+w combination - WiFi toggle
+                LOG_DEBUG("CardKB: fn+w pressed, WiFi toggle");
+                e.inputEvent = INPUT_BROKER_ANYKEY;
+                e.kbchar = INPUT_BROKER_MSG_WIFI_TOGGLE; // WiFi toggle on/off
+                break;
+            case 0x77: // 'w' character - if sym pressed, WiFi toggle
+                if (is_sym) {
+                    is_sym = false; // reset sym state after second keypress
+                    LOG_DEBUG("CardKB: sym+w pressed, WiFi toggle");
+                    e.inputEvent = INPUT_BROKER_ANYKEY;
+                    e.kbchar = INPUT_BROKER_MSG_WIFI_TOGGLE;
+                } else {
+                    e.inputEvent = INPUT_BROKER_ANYKEY;
+                    e.kbchar = c; // normal 'w' character
+                }
                 break;
             case 0x0d: // Enter
                 e.inputEvent = INPUT_BROKER_SELECT;
@@ -504,14 +622,42 @@ int32_t KbI2cBase::runOnce()
                     e.inputEvent = INPUT_BROKER_NONE;
                     break;
                 }
+                // For regular keys, reset sym state if it was active
+                if (is_sym) {
+                    is_sym = false; // reset sym state for unhandled keys
+                }
                 e.inputEvent = INPUT_BROKER_ANYKEY;
                 e.kbchar = c;
-                is_sym = false;
                 break;
             }
 
+            // Only log non-zero CardKB key presses to avoid spam from 0x00 (no key pressed)
+            if (c != 0x00) {
+                LOG_DEBUG("CardKB RAW: 0x%02X (%d) '%c'", c, c, (c >= 32 && c <= 126) ? c : '?');
+            }
+
             if (e.inputEvent != INPUT_BROKER_NONE) {
-                this->notifyObservers(&e);
+                if (c != 0x00) { // Don't log processed events for 0x00
+                    LOG_DEBUG("CardKB PROCESSED: event=%d kbchar=%d", e.inputEvent, e.kbchar);
+                }
+                {
+                    bool allow = true;
+                    uint32_t now = millis();
+                    if (now - _kb_last_notify_ms < KB_DEBOUNCE_MS) allow = false;
+                    if (allow && powerStatus) {
+                        int pct = powerStatus->getBatteryChargePercent();
+                        int mv = powerStatus->getBatteryVoltageMv();
+                        if ((pct >= 0 && pct < KB_BATTERY_PCT_THRESHOLD) || (mv > 0 && mv < KB_BATTERY_MV_THRESHOLD)) {
+                            if (now - _kb_last_notify_ms < KB_LOWV_NOTIFY_MS) allow = false;
+                        }
+                    }
+                    if (allow) {
+                        _kb_last_notify_ms = now;
+                        this->notifyObservers(&e);
+                    } else {
+                        LOG_DEBUG("CardKB: event suppressed (debounce/lowV). evt=%d char=%d", e.inputEvent, e.kbchar);
+                    }
+                }
             }
         }
         break;

@@ -1079,11 +1079,123 @@ class LGFX : public lgfx::LGFX_Device
 
 static LGFX *tft = nullptr;
 
+#elif defined(USE_ST7920)
+// ST7920 128x64 LCD with U8G2 library
+#include <U8g2lib.h>
+
+// Define dummy compatibility constants for ST7920
+#define TFT_BLACK 0x0000
+#define TFT_WHITE 0xFFFF
+#define TFT_MESH TFT_WHITE
+
+class ST7920Display_TFT {
+public:
+    U8G2_ST7920_128X64_F_SW_SPI u8g2;
+    
+    ST7920Display_TFT() : u8g2(U8G2_R0, ST7920_CLK, ST7920_MOSI, ST7920_CS, ST7920_RST) {}
+    
+    void begin() {
+        // Setup PWM for contrast if V0 pin is defined
+#ifdef ST7920_V0
+        pinMode(ST7920_V0, OUTPUT);
+        ledcSetup(0, 1000, 8);
+        ledcAttachPin(ST7920_V0, 0);
+        ledcWrite(0, 127); // Medium contrast
+#endif
+        u8g2.begin();
+        u8g2.clearBuffer();
+        u8g2.sendBuffer();
+    }
+    
+    void drawBuffer(uint8_t *buffer, int width, int height) {
+        u8g2.clearBuffer();
+        
+        // Convert OLEDDisplay buffer to U8G2 format
+        for (int y = 0; y < height && y < 64; y++) {
+            for (int x = 0; x < width && x < 128; x++) {
+                int byteIndex = x + (y / 8) * width;
+                int bitIndex = y % 8;
+                
+                if (buffer[byteIndex] & (1 << bitIndex)) {
+                    u8g2.drawPixel(x, y);
+                }
+            }
+        }
+        
+        u8g2.sendBuffer();
+    }
+    
+    void setBrightness(uint8_t brightness) {
+#ifdef ST7920_V0
+        ledcWrite(0, 255 - brightness); // Inverted for ST7920
+#endif
+    }
+    
+    void pushRect(int x, int y, int width, int height, uint16_t *data) {
+        // ST7920 doesn't support direct rect push, so we ignore this for now
+        // The display() method handles all updates
+    }
+    
+    void powerSaveOff() {
+        // Wake up display - for ST7920 this is just turning on
+        u8g2.setPowerSave(0);
+#ifdef ST7920_V0
+        ledcWrite(0, 127); // Restore medium contrast
+#endif
+    }
+    
+    void powerSaveOn() {
+        // Put display to sleep and turn off contrast PWM
+#ifdef ST7920_V0
+        ledcWrite(0, 255); // Turn off contrast (high voltage on V0)
+#endif
+        u8g2.setPowerSave(1);
+    }
+    
+    // Dummy compatibility methods
+    void fillScreen(uint16_t color) {
+        if (color == TFT_BLACK) {
+            u8g2.clearBuffer();
+            u8g2.sendBuffer();
+        } else {
+            u8g2.drawBox(0, 0, 128, 64);
+            u8g2.sendBuffer();
+        }
+    }
+    
+    void wakeup() { 
+        // Wake up ST7920 and restore contrast
+        u8g2.setPowerSave(0);
+#ifdef ST7920_V0
+        ledcWrite(0, 127); // Restore medium contrast
+#endif
+    }
+    
+    void sleep() { 
+        // Put ST7920 to sleep and turn off contrast PWM
+#ifdef ST7920_V0
+        ledcWrite(0, 255); // Turn off contrast (high voltage on V0)
+#endif
+        u8g2.setPowerSave(1);
+    }
+    void* touch() { return nullptr; }
+    bool getTouch(int16_t* x, int16_t* y) { return false; }
+};
+
+static ST7920Display_TFT *st7920_tft = nullptr;
+static ST7920Display_TFT *tft = nullptr; // Compatibility pointer
+
+// Dummy LGFX class for compatibility
+class LGFX {
+public:
+    void init() {}
+};
+
 #endif
 
 #if defined(ST7701_CS) || defined(ST7735_CS) || defined(ST7789_CS) || defined(ST7796_CS) || defined(ILI9341_DRIVER) ||           \
     defined(ILI9342_DRIVER) || defined(RAK14014) || defined(HX8357_CS) || defined(ILI9488_CS) || defined(ST72xx_DE) ||           \
-    (ARCH_PORTDUINO && HAS_SCREEN != 0)
+    defined(USE_ST7920) || (ARCH_PORTDUINO && HAS_SCREEN != 0)
 #include "SPILock.h"
 #include "TFTDisplay.h"
 #include <SPI.h>
@@ -1120,6 +1232,13 @@ TFTDisplay::TFTDisplay(uint8_t address, int sda, int scl, OLEDDISPLAY_GEOMETRY g
         setGeometry(GEOMETRY_RAWMODE, portduino_config.displayHeight, portduino_config.displayHeight);
     }
 
+#elif defined(USE_ST7920)
+    setGeometry(GEOMETRY_RAWMODE, 128, 64);
+    // Initialize ST7920
+    st7920_tft = new ST7920Display_TFT();
+    tft = st7920_tft; // Set compatibility pointer
+    st7920_tft->begin();
+    LOG_INFO("ST7920 TFTDisplay initialized");
 #elif defined(SCREEN_ROTATE)
     setGeometry(GEOMETRY_RAWMODE, TFT_HEIGHT, TFT_WIDTH);
 #else
@@ -1139,6 +1258,12 @@ TFTDisplay::~TFTDisplay()
 // Write the buffer to the display memory
 void TFTDisplay::display(bool fromBlank)
 {
+#ifdef USE_ST7920
+    if (st7920_tft) {
+        st7920_tft->drawBuffer(buffer, displayWidth, displayHeight);
+        return;
+    }
+#endif
     if (fromBlank)
         tft->fillScreen(TFT_BLACK);
 
@@ -1338,6 +1463,13 @@ void TFTDisplay::sendCommand(uint8_t com)
 
 void TFTDisplay::setDisplayBrightness(uint8_t _brightness)
 {
+#ifdef USE_ST7920
+    if (st7920_tft) {
+        st7920_tft->setBrightness(_brightness);
+        LOG_DEBUG("ST7920 Brightness is set to value: %i ", _brightness);
+        return;
+    }
+#endif
 #ifdef RAK14014
     // todo
 #else
@@ -1392,6 +1524,14 @@ void TFTDisplay::setDetected(uint8_t detected)
 // Connect to the display
 bool TFTDisplay::connect()
 {
+#ifdef USE_ST7920
+    // ST7920 is already initialized in constructor
+    if (st7920_tft) {
+        LOG_INFO("ST7920 TFTDisplay connected");
+        return true;
+    }
+    return false;
+#else
     concurrency::LockGuard g(spiLock);
     LOG_INFO("Do TFT init");
 #ifdef RAK14014
@@ -1438,6 +1578,7 @@ bool TFTDisplay::connect()
         }
     }
     return true;
+#endif // !USE_ST7920
 }
 
 #endif

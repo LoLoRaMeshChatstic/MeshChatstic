@@ -9,6 +9,14 @@
 #include <string>
 #include <vector>
 
+#ifdef USE_STATUS_DISPLAY
+#include "StatusDisplay.h"
+#endif
+
+#ifdef ST7920_CLK
+// ST7920 is now integrated into TFTDisplay
+#endif
+
 #define getStringCenteredX(s) ((SCREEN_WIDTH - display->getStringWidth(s)) / 2)
 namespace graphics
 {
@@ -224,6 +232,7 @@ class Screen : public concurrency::OSThread
   public:
     OLEDDisplay *getDisplayDevice() { return dispdev; }
     OLEDDisplayUi *getUI() { return ui; }
+// ST7920 is now integrated into TFTDisplay
     bool isShowingNormalScreen() const { return showingNormalScreen; }
     explicit Screen(ScanI2C::DeviceAddress, meshtastic_Config_DisplayConfig_OledType, OLEDDISPLAY_GEOMETRY);
     size_t frameCount = 0; // Total number of active frames
@@ -257,6 +266,13 @@ class Screen : public concurrency::OSThread
     OLEDDISPLAY_GEOMETRY geometry;
 
     bool isOverlayBannerShowing();
+
+    /**
+     * Show a new-message banner on the secondary status display only.
+     * Returns true if the secondary display handled the banner (primary should not be woken),
+     * false otherwise.
+     */
+    bool showSecondaryMessageBanner(const meshtastic_MeshPacket *packet);
 
     // Stores the last 4 of our hardware ID, to make finding the device for pairing easier
     // FIXME: Needs refactoring and getMacAddr needs to be moved to a utility class
@@ -771,6 +787,11 @@ class Screen : public concurrency::OSThread
     // Bluetooth PIN screen)
     bool showingNormalScreen = false;
 
+#ifdef ST7920_CLK
+    /// Whether ST7920 is used as primary display
+    // ST7920 is now managed by TFTDisplay
+#endif
+
     // Implementation to Adjust Brightness
     uint8_t brightness = BRIGHTNESS_DEFAULT; // H = 254, MH = 192, ML = 130 L = 103
 
@@ -786,6 +807,13 @@ class Screen : public concurrency::OSThread
 
     /// UI helper for rendering to frames and switching between them
     OLEDDisplayUi *ui;
+
+#ifdef USE_STATUS_DISPLAY
+    /// Secondary status display (shows system information)
+    StatusDisplay *statusDisplay = nullptr;
+#endif
+
+// ST7920 is now part of TFTDisplay
 };
 
 // Marquee auto-scroll functions

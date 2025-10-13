@@ -28,6 +28,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #if HAS_SCREEN
 #include <OLEDDisplay.h>
 
+#ifdef USE_STATUS_DISPLAY
+#include "StatusDisplay.h"
+#endif
+
 #include "DisplayFormatters.h"
 #include "TimeFormatters.h"
 #include "draw/ClockRenderer.h"
@@ -45,6 +49,9 @@ extern CannedMessageModule *cannedMessageModule;
 #endif
 
 #include "modules/ChatHistoryStore.h"
+#include "ScreenChatHistory.h"
+
+// ST7920 is now integrated into TFTDisplay
 
 #if !MESHTASTIC_EXCLUDE_GPS
 #include "GPS.h"
@@ -525,6 +532,8 @@ static void drawLineSmall(OLEDDisplay *display, int16_t x, int16_t y, const char
     display->setTextAlignment(TEXT_ALIGN_LEFT);
     display->setFont(FONT_SMALL);
     display->drawString(x, y, s);
+
+// ST7920 display is now the primary display when USE_ST7920 is defined
 }
 
 // Function to detect if a message needs extra height (emotes or line breaks)
@@ -709,6 +718,8 @@ void Screen::showSimpleBanner(const char *message, uint32_t durationMs)
     options.durationMs = durationMs;
     options.notificationType = notificationTypeEnum::text_banner;
     showOverlayBanner(options);
+
+// ST7920 now shows messages through the main display system
 }
 
 // Called to trigger a banner with custom message and duration
@@ -915,21 +926,81 @@ void Screen::showNewMessageBanner(const meshtastic_MeshPacket *packet)
         }
     }
 
-    // Create banner message: "new msg 'sourceName'"
-    static char bannerMsg[128];
-    snprintf(bannerMsg, sizeof(bannerMsg), "new msg '%s'", sourceName.c_str());
+    // Extract message preview
+    std::string messagePreview;
+    if (packet->decoded.payload.size > 0 && packet->decoded.payload.bytes) {
+        messagePreview.assign(reinterpret_cast<const char *>(packet->decoded.payload.bytes), 
+                             std::min((size_t)packet->decoded.payload.size, (size_t)40)); // Limit to 40 chars
+    } else {
+        messagePreview = "[Empty message]";
+    }
 
-    // Configure banner options for 5-second display
-    BannerOverlayOptions bannerOptions;
-    bannerOptions.message = bannerMsg;
-    bannerOptions.durationMs = 5000;         // 5 seconds as requested
-    bannerOptions.optionsArrayPtr = nullptr; // No options = simple banner
-    bannerOptions.optionsCount = 0;
-    bannerOptions.bannerCallback = nullptr;
-    bannerOptions.notificationType = notificationTypeEnum::text_banner;
+    // ALWAYS show ONLY on secondary display (no main display banner)
+#ifdef USE_STATUS_DISPLAY
+    if (statusDisplay) {
+        statusDisplay->updateUnreadCount();
+        statusDisplay->showMessageBanner(sourceName.c_str(), messagePreview.c_str(), 5000);
+    }
+#endif
 
-    // Show the banner
-    showOverlayBanner(bannerOptions);
+    // NOTE: Completely removed main display banner - showing ONLY on secondary display as requested
+    // No showOverlayBanner() call anymore
+}
+
+bool Screen::showSecondaryMessageBanner(const meshtastic_MeshPacket *packet)
+{
+    if (!packet) return false;
+    // If no secondary display available, can't handle it
+#ifdef USE_STATUS_DISPLAY
+    if (!statusDisplay) return false;
+#else
+    return false;  // No status display available
+#endif
+
+    // ONLY handle in secondary if main screen is OFF
+    // If main screen is ON, let the normal flow handle it (return false)
+    if (screenOn) return false;
+
+    // Determine source name same as showNewMessageBanner
+    std::string sourceName;
+    const bool isDirect = (nodeDB && packet->to == nodeDB->getNodeNum());
+
+    if (isDirect) {
+        const meshtastic_NodeInfoLite *cn = nodeDB->getMeshNode(packet->from);
+        if (cn && cn->has_user && cn->user.short_name[0]) {
+            sourceName = cn->user.short_name;
+        } else {
+            char nodeHex[16];
+            snprintf(nodeHex, sizeof(nodeHex), "!%08x", packet->from);
+            sourceName = nodeHex;
+        }
+    } else {
+        const char *channelName = channels.getName(packet->channel);
+        if (channelName && channelName[0]) {
+            sourceName = channelName;
+        } else {
+            char channelHex[16];
+            snprintf(channelHex, sizeof(channelHex), "Ch #%d", packet->channel);
+            sourceName = channelHex;
+        }
+    }
+
+    // Build preview
+    std::string messagePreview;
+    if (packet->decoded.payload.size > 0 && packet->decoded.payload.bytes) {
+        messagePreview.assign(reinterpret_cast<const char *>(packet->decoded.payload.bytes), 
+                              std::min((size_t)packet->decoded.payload.size, (size_t)40));
+    } else {
+        messagePreview = "[Empty]";
+    }
+
+    // Update unread count and show on secondary
+#ifdef USE_STATUS_DISPLAY
+    statusDisplay->updateUnreadCount();
+    statusDisplay->showMessageBanner(sourceName.c_str(), messagePreview.c_str(), 5000);
+#endif
+
+    return true;
 }
 
 // Ignore messages originating from phone (from the current node 0x0) unless range test or store and forward module are enabled
@@ -1033,6 +1104,10 @@ Screen::Screen(ScanI2C::DeviceAddress address, meshtastic_Config_DisplayConfig_O
 #elif defined(USE_ST7567)
     dispdev = new ST7567Wire(address.address, -1, -1, geometry,
                              (address.port == ScanI2C::I2CPort::WIRE1) ? HW_I2C::I2C_TWO : HW_I2C::I2C_ONE);
+#elif defined(ST7735_CS) || defined(ILI9341_DRIVER) || defined(ILI9342_DRIVER) || defined(ST7701_CS) || defined(ST7789_CS) || \
+    defined(RAK14014) || defined(HX8357_CS) || defined(ILI9488_CS) || defined(ST7796_CS) || defined(USE_ST7920)
+    dispdev = new TFTDisplay(address.address, -1, -1, geometry,
+                             (address.port == ScanI2C::I2CPort::WIRE1) ? HW_I2C::I2C_TWO : HW_I2C::I2C_ONE);
 #elif ARCH_PORTDUINO
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         if (portduino_config.displayPanel != no_screen) {
@@ -1053,11 +1128,21 @@ Screen::Screen(ScanI2C::DeviceAddress address, meshtastic_Config_DisplayConfig_O
 
     ui = new OLEDDisplayUi(dispdev);
     cmdQueue.setReader(this);
+
+// ST7920 is now handled as part of TFTDisplay when USE_ST7920 is defined
 }
 
 Screen::~Screen()
 {
     delete[] graphics::normalFrames;
+// ST7920 is now cleaned up automatically by TFTDisplay
+
+#ifdef USE_STATUS_DISPLAY
+    if (statusDisplay) {
+        delete statusDisplay;
+        statusDisplay = nullptr;
+    }
+#endif
 }
 
 /**
@@ -1083,6 +1168,15 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
         if (on) {
             LOG_INFO("Turn on screen");
             powerMon->setState(meshtastic_PowerMon_State_Screen_On);
+#ifdef VEXT_ENABLE
+            // Ensure Vext rail is enabled before powering up the display.
+            pinMode(VEXT_ENABLE, OUTPUT);
+            digitalWrite(VEXT_ENABLE, VEXT_ON_VALUE);
+#ifdef VEXT_ENABLE_2
+            pinMode(VEXT_ENABLE_2, OUTPUT);
+            digitalWrite(VEXT_ENABLE_2, VEXT_ON_VALUE);
+#endif
+#endif
 #ifdef T_WATCH_S3
             PMU->enablePowerOutput(XPOWERS_ALDO2);
 #endif
@@ -1136,6 +1230,21 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
 #endif
 
             dispdev->displayOff();
+
+#ifdef VEXT_ENABLE
+            // Per-user request: drive the Heltec Vext pins HIGH when putting the
+            // display to global sleep so the hardware power rail is turned off.
+            // Note: for Heltec V3 VEXT_ON_VALUE is LOW (active low), so setting
+            // HIGH disables the LDO. We set HIGH unconditionally here as the
+            // user asked for HIGH on sleep; if different behavior is required
+            // change accordingly.
+            pinMode(VEXT_ENABLE, OUTPUT);
+            digitalWrite(VEXT_ENABLE, HIGH);
+#ifdef VEXT_ENABLE_2
+            pinMode(VEXT_ENABLE_2, OUTPUT);
+            digitalWrite(VEXT_ENABLE_2, HIGH);
+#endif
+#endif
 #ifdef USE_ST7789
             SPI1.end();
 #if defined(ARCH_ESP32)
@@ -1157,8 +1266,22 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
             PMU->disablePowerOutput(XPOWERS_ALDO2);
 #endif
             enabled = false;
+
+#ifdef USE_STATUS_DISPLAY
+            // Also power off status display when main screen goes off
+            if (statusDisplay) {
+                statusDisplay->setPowerSave(true);
+            }
+#endif
         }
         screenOn = on;
+
+#ifdef USE_STATUS_DISPLAY
+        // Power on status display when main screen comes on
+        if (on && statusDisplay) {
+            statusDisplay->setPowerSave(false);
+        }
+#endif
     }
 }
 
@@ -1310,6 +1433,22 @@ void Screen::setup()
 
     // === Notify modules that support UI events ===
     MeshModule::observeUIEvents(&uiFrameEventObserver);
+
+#ifdef USE_STATUS_DISPLAY
+    // === Initialize secondary status display ===
+    statusDisplay = new StatusDisplay();
+    if (statusDisplay && statusDisplay->init(STATUS_SDA, STATUS_SCL, STATUS_ADDR)) {
+        LOG_INFO("Status display initialized on SDA=%d, SCL=%d", STATUS_SDA, STATUS_SCL);
+        statusDisplay->subscribeToStatus();
+        statusDisplay->setEnabled(true);
+    } else {
+        LOG_WARN("Failed to initialize status display");
+        if (statusDisplay) {
+            delete statusDisplay;
+            statusDisplay = nullptr;
+        }
+    }
+#endif
 }
 
 void Screen::forceDisplay(bool forceUiUpdate)
@@ -1512,6 +1651,13 @@ int32_t Screen::runOnce()
             handleOnPress();
         }
     }
+
+    // === Update status display ===
+#ifdef USE_STATUS_DISPLAY
+    if (statusDisplay && statusDisplay->isEnabled()) {
+        statusDisplay->loop();
+    }
+#endif
 
     // LOG_DEBUG("want fps %d, fixed=%d", targetFramerate,
     // ui->getUiState()->frameState); If we are scrolling we need to be called
@@ -2652,6 +2798,47 @@ int Screen::handleInputEvent(const InputEvent *event)
                     }
                     return 1;
                 }
+
+                // Quick-launch emote carousel with fn+e when inside a chat frame (DM or Channel)
+                if (event->inputEvent == INPUT_BROKER_ANYKEY && event->kbchar == INPUT_BROKER_MSG_EMOTE_LIST) {
+                    if (inNodeChat) {
+                        size_t idx = (size_t)cf - g_favChatFirst;
+                        if (idx < g_favChatNodes.size() && cannedMessageModule) {
+                            NodeNum dest = g_favChatNodes[idx];
+                            uint8_t channel = 0; // DM doesn't use channel
+                            cannedMessageModule->LaunchEmoteCarousel(dest, channel);
+                            return 1;
+                        }
+                    } else {
+                        size_t idx = (size_t)cf - g_chanTabFirst;
+                        if (idx < g_chanTabs.size() && cannedMessageModule) {
+                            uint8_t ch = g_chanTabs[idx];
+                            cannedMessageModule->LaunchEmoteCarousel(NODENUM_BROADCAST, ch);
+                            return 1;
+                        }
+                    }
+                }
+
+                // If any key (other than fn+e) is pressed while in a chat, select this chat as destination
+                // and launch the canned message flow so the destination is selected (mirrors behavior when
+                // opening from menus). This ensures fn+e and any other key both set the destination.
+                if (event->inputEvent == INPUT_BROKER_ANYKEY && event->kbchar != INPUT_BROKER_MSG_EMOTE_LIST) {
+                    if (inNodeChat) {
+                        size_t idx = (size_t)cf - g_favChatFirst;
+                        if (idx < g_favChatNodes.size() && cannedMessageModule) {
+                            NodeNum dest = g_favChatNodes[idx];
+                            cannedMessageModule->LaunchWithDestination(dest);
+                            return 1;
+                        }
+                    } else {
+                        size_t idx = (size_t)cf - g_chanTabFirst;
+                        if (idx < g_chanTabs.size() && cannedMessageModule) {
+                            uint8_t ch = g_chanTabs[idx];
+                            cannedMessageModule->LaunchWithDestination(NODENUM_BROADCAST, ch);
+                            return 1;
+                        }
+                    }
+                }
             }
 
             // === Original global navigation ===
@@ -2659,6 +2846,23 @@ int Screen::handleInputEvent(const InputEvent *event)
                 showPrevFrame();
             } else if (event->inputEvent == INPUT_BROKER_RIGHT || event->inputEvent == INPUT_BROKER_USER_PRESS) {
                 showNextFrame();
+            // === NEW: Vertical scroll ONLY for NodeList frames (Bearings/HopSignal/Dynamic) ===
+            } else if (event->inputEvent == INPUT_BROKER_UP) {
+                uint8_t cff = this->ui->getUiState()->currentFrame;
+                // ONLY scroll in NodeList frames - no carousel navigation
+                if (cff == framesetInfo.positions.nodelist_bearings || 
+                    cff == framesetInfo.positions.nodelist_hopsignal || 
+                    cff == framesetInfo.positions.nodelist) { // Dynamic frame
+                    graphics::NodeListRenderer::scrollUp(); // Scroll up within the list
+                }
+            } else if (event->inputEvent == INPUT_BROKER_DOWN) {
+                uint8_t cff = this->ui->getUiState()->currentFrame;
+                // ONLY scroll in NodeList frames - no carousel navigation  
+                if (cff == framesetInfo.positions.nodelist_bearings || 
+                    cff == framesetInfo.positions.nodelist_hopsignal || 
+                    cff == framesetInfo.positions.nodelist) { // Dynamic frame
+                    graphics::NodeListRenderer::scrollDown(); // Scroll down within the list
+                }
             } else if (event->inputEvent == INPUT_BROKER_SELECT) {
                 uint8_t cff = this->ui->getUiState()->currentFrame;
 
@@ -2852,6 +3056,58 @@ void Screen::showFrame(const std::string &frameName)
 #else
 graphics::Screen::Screen(ScanI2C::DeviceAddress, meshtastic_Config_DisplayConfig_OledType, OLEDDISPLAY_GEOMETRY) {}
 #endif // HAS_SCREEN
+
+// === DisplayIface Implementation ===
+// These methods are used by ScreenChatHistory and other UI components
+void DisplayIface::clear()
+{
+    if (screen && screen->getDisplayDevice()) {
+        screen->getDisplayDevice()->clear();
+// ST7920 is now the primary display when USE_ST7920 is defined
+    }
+}
+
+void DisplayIface::drawText(int x, int y, const char *txt, bool invert)
+{
+    if (screen && screen->getDisplayDevice()) {
+        auto display = screen->getDisplayDevice();
+        display->setTextAlignment(TEXT_ALIGN_LEFT);
+        display->setFont(FONT_SMALL);
+        if (invert) {
+            // Draw inverted text (highlighted)
+            display->setColor(BLACK);
+            int textWidth = display->getStringWidth(txt);
+            display->fillRect(x, y, textWidth, FONT_HEIGHT_SMALL);
+            display->setColor(WHITE);
+        } else {
+            display->setColor(WHITE);
+        }
+        display->drawString(x, y, txt);
+
+// ST7920 displays text through the main display system
+    }
+}
+
+int DisplayIface::lineHeight()
+{
+    return FONT_HEIGHT_SMALL;
+}
+
+int DisplayIface::width()
+{
+    if (screen && screen->getDisplayDevice()) {
+        return screen->getDisplayDevice()->getWidth();
+    }
+    return 128; // Default fallback
+}
+
+int DisplayIface::height()
+{
+    if (screen && screen->getDisplayDevice()) {
+        return screen->getDisplayDevice()->getHeight();
+    }
+    return 64; // Default fallback
+}
 
 } // namespace graphics
 

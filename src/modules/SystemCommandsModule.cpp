@@ -11,6 +11,13 @@
 #include "main.h"
 #include "modules/AdminModule.h"
 #include "modules/ExternalNotificationModule.h"
+#if HAS_WIFI
+#include "wifi/WiFiAPClient.h"
+#include <WiFi.h>
+#if !defined(ARCH_PORTDUINO)
+#include "graphics/draw/MenuHandler.h"
+#endif
+#endif
 
 SystemCommandsModule *systemCommandsModule;
 
@@ -79,6 +86,34 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
         nodeDB->saveToDisk();
         rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
         // runState = CANNED_MESSAGE_RUN_STATE_INACTIVE;
+        return true;
+    // WiFi Toggle
+    case INPUT_BROKER_MSG_WIFI_TOGGLE:
+#if HAS_WIFI
+        config.network.wifi_enabled = !config.network.wifi_enabled;
+        LOG_INFO("User toggled WiFi: %s", config.network.wifi_enabled ? "ON" : "OFF");
+        nodeDB->saveToDisk();
+        if (config.network.wifi_enabled) {
+            initWifi();
+            IF_SCREEN(screen->showSimpleBanner("WiFi ON", 3000));
+        } else {
+            deinitWifi();
+            IF_SCREEN(screen->showSimpleBanner("WiFi OFF", 3000));
+        }
+#else
+        IF_SCREEN(screen->showSimpleBanner("WiFi not supported", 3000));
+#endif
+        return true;
+    // WiFi Scan - use existing menu system
+    case INPUT_BROKER_MSG_WIFI_SCAN:
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+        // Use the existing WiFi scan menu system
+        graphics::menuHandler::menuQueue = graphics::menuHandler::wifi_scan_menu;
+        IF_SCREEN(screen->runNow());
+        LOG_INFO("Opening WiFi scan menu via CardKB");
+#else
+        IF_SCREEN(screen->showSimpleBanner("WiFi not supported", 3000));
+#endif
         return true;
     }
 

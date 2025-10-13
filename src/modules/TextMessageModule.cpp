@@ -31,7 +31,17 @@ ProcessMessage TextMessageModule::handleReceived(const meshtastic_MeshPacket &mp
 
     // Only trigger screen wake if configuration allows it
     if (shouldWakeOnReceivedMessage()) {
-        powerFSM.trigger(EVENT_RECEIVED_MSG);
+        // If screen exists and has a secondary status display, prefer showing the banner there
+        // without waking the main display (avoids toggling Vext). If the secondary handled it,
+        // skip waking the main display.
+        bool handledBySecondary = false;
+        if (screen) {
+            handledBySecondary = screen->showSecondaryMessageBanner(&mp);
+        }
+
+        if (!handledBySecondary) {
+            powerFSM.trigger(EVENT_RECEIVED_MSG);
+        }
     }
     notifyObservers(&mp);
 

@@ -175,6 +175,7 @@ void CannedMessageModule::LaunchFreetextWithDestination(NodeNum newDest, uint8_t
     lastChannel = channel;
     lastDestSet = true;
 
+    freetextScrollOffset = 0; // Reset scroll when starting freetext
     runState = CANNED_MESSAGE_RUN_STATE_FREETEXT;
     requestFocus();
     UIFrameEvent e;
@@ -369,15 +370,15 @@ void CannedMessageModule::drawHeader(OLEDDisplay *display, int16_t x, int16_t y,
     // Normal header behavior
     if (graphics::isHighResolution) {
         if (this->dest == NODENUM_BROADCAST) {
-            display->drawStringf(x, y, buffer, "To: @%s", channels.getName(this->channel));
+            display->drawStringf(x, y, buffer, "@%s", channels.getName(this->channel));
         } else {
-            display->drawStringf(x, y, buffer, "To: %s", getNodeName(this->dest));
+            display->drawStringf(x, y, buffer, "%s", getNodeName(this->dest));
         }
     } else {
         if (this->dest == NODENUM_BROADCAST) {
-            display->drawStringf(x, y, buffer, "To: @%.9s", channels.getName(this->channel));
+            display->drawStringf(x, y, buffer, "@%.9s", channels.getName(this->channel));
         } else {
-            display->drawStringf(x, y, buffer, "To: %s", getNodeName(this->dest));
+            display->drawStringf(x, y, buffer, "%s", getNodeName(this->dest));
         }
     }
 }
@@ -570,8 +571,11 @@ int CannedMessageModule::handleInputEvent(const InputEvent *event)
         if (event->inputEvent == INPUT_BROKER_UP || event->inputEvent == INPUT_BROKER_DOWN) {
             return 0; // Always let chat navigation handle UP/DOWN
         }
-        // Printable char (ASCII) opens free text compose
-        if (event->kbchar >= 32 && event->kbchar <= 126) {
+        // Printable char (ASCII and Spanish characters) opens free text compose
+        if ((event->kbchar >= 32 && event->kbchar <= 126) || 
+            event->kbchar == 209 || event->kbchar == 241) {  // Ñ and ñ
+            LOG_DEBUG("CannedMessage: Opening freetext for char %d ('%c')", event->kbchar, 
+                     (event->kbchar >= 32 && event->kbchar <= 126) ? event->kbchar : '?');
             runState = CANNED_MESSAGE_RUN_STATE_FREETEXT;
             requestFocus();
             UIFrameEvent e;
@@ -606,7 +610,8 @@ bool CannedMessageModule::isUpEvent(const InputEvent *event)
     if (runState == CANNED_MESSAGE_RUN_STATE_ACTIVE || runState == CANNED_MESSAGE_RUN_STATE_EMOTE_PICKER ||
         runState == CANNED_MESSAGE_RUN_STATE_EMOTE_CAROUSEL || runState == CANNED_MESSAGE_RUN_STATE_MESSAGE_CAROUSEL ||
         runState == CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION ||
-        runState == CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION_FOR_EMOTE) {
+        runState == CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION_FOR_EMOTE || 
+        runState == CANNED_MESSAGE_RUN_STATE_FREETEXT) {
         return event->inputEvent == INPUT_BROKER_UP || event->inputEvent == INPUT_BROKER_LEFT ||
                event->inputEvent == INPUT_BROKER_ALT_PRESS;
     }
@@ -623,7 +628,8 @@ bool CannedMessageModule::isDownEvent(const InputEvent *event)
     if (runState == CANNED_MESSAGE_RUN_STATE_ACTIVE || runState == CANNED_MESSAGE_RUN_STATE_EMOTE_PICKER ||
         runState == CANNED_MESSAGE_RUN_STATE_EMOTE_CAROUSEL || runState == CANNED_MESSAGE_RUN_STATE_MESSAGE_CAROUSEL ||
         runState == CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION ||
-        runState == CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION_FOR_EMOTE) {
+        runState == CANNED_MESSAGE_RUN_STATE_DESTINATION_SELECTION_FOR_EMOTE || 
+        runState == CANNED_MESSAGE_RUN_STATE_FREETEXT) {
         return event->inputEvent == INPUT_BROKER_DOWN || event->inputEvent == INPUT_BROKER_RIGHT ||
                event->inputEvent == INPUT_BROKER_USER_PRESS;
     }
@@ -672,7 +678,9 @@ int CannedMessageModule::handleDestinationSelectionInput(const InputEvent *event
         }
     }
 
-    if (event->kbchar >= 32 && event->kbchar <= 126 && !isUp && !isDown && event->inputEvent != INPUT_BROKER_LEFT &&
+    if (((event->kbchar >= 32 && event->kbchar <= 126) || 
+         event->kbchar == 209 || event->kbchar == 241) &&  // Ñ and ñ
+        !isUp && !isDown && event->inputEvent != INPUT_BROKER_LEFT &&
         event->inputEvent != INPUT_BROKER_RIGHT && event->inputEvent != INPUT_BROKER_SELECT) {
         this->searchQuery += (char)event->kbchar;
         needsUpdate = true;
@@ -1046,8 +1054,13 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
         // ---- All hardware keys fall through to here (CardKB, physical, etc.) ----
 
         if (event->kbchar == INPUT_BROKER_MSG_EMOTE_LIST) {
-            emoteDirectSend = false; // Reset flag - this is freetext insertion mode
-            runState = CANNED_MESSAGE_RUN_STATE_EMOTE_PICKER;
+            // Launch emote carousel directly with broadcast/current destination
+            NodeNum targetDest = (dest != 0) ? dest : NODENUM_BROADCAST;
+            uint8_t targetChannel = channel;
+            if (targetChannel >= channels.getNumChannels())
+                targetChannel = 0;
+            
+            LaunchEmoteCarousel(targetDest, targetChannel);
             requestFocus();
             screen->forceDisplay();
             return true;
@@ -1094,6 +1107,26 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
             return true;
         }
 
+        // Scroll up in freetext (UP arrow from CardKB)
+        if (event->inputEvent == INPUT_BROKER_UP) {
+            if (freetextScrollOffset > 0) {
+                freetextScrollOffset--;
+                lastTouchMillis = millis();
+                // Force redraw without processing payload
+                screen->forceDisplay();
+            }
+            return true;
+        }
+        // Scroll down in freetext (DOWN arrow from CardKB)  
+        if (event->inputEvent == INPUT_BROKER_DOWN) {
+            // We'll calculate max scroll in the rendering logic
+            freetextScrollOffset++;
+            lastTouchMillis = millis();
+            // Force redraw without processing payload
+            screen->forceDisplay();
+            return true;
+        }
+
         // Cancel (dismiss freetext screen)
         if (event->inputEvent == INPUT_BROKER_CANCEL || event->inputEvent == INPUT_BROKER_ALT_LONG ||
             (event->inputEvent == INPUT_BROKER_BACK && this->freetext.length() == 0)) {
@@ -1109,6 +1142,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
             runState = CANNED_MESSAGE_RUN_STATE_INACTIVE;
             freetext = "";
             cursor = 0;
+            freetextScrollOffset = 0; // Reset scroll offset
             payload = 0;
             currentMessageIndex = -1;
 
@@ -1125,8 +1159,11 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
             return handleTabSwitch(event); // Reuse tab logic
         }
 
-        // Printable ASCII (add char to draft)
-        if (event->kbchar >= 32 && event->kbchar <= 126) {
+        // Printable ASCII and Spanish characters (add char to draft)
+        if ((event->kbchar >= 32 && event->kbchar <= 126) || 
+            event->kbchar == 209 || event->kbchar == 241) {  // Ñ and ñ
+            LOG_DEBUG("CannedMessage: Adding char %d ('%c') to freetext", event->kbchar,
+                     (event->kbchar >= 32 && event->kbchar <= 126) ? event->kbchar : '?');
             payload = event->kbchar;
             lastTouchMillis = millis();
             runOnce();
@@ -1689,22 +1726,38 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
                 case INPUT_BROKER_RIGHT:
                     break;
                 default:
-                    // Only insert ASCII printable characters (32–126)
-                    if (this->payload >= 32 && this->payload <= 126) {
+                    // Insert ASCII printable characters (32–126) and Spanish characters (Ñ, ñ)
+                    if ((this->payload >= 32 && this->payload <= 126) || 
+                        this->payload == 209 || this->payload == 241) {
+                        LOG_DEBUG("CannedMessage: Inserting char %d ('%c') into freetext", this->payload,
+                                 (this->payload >= 32 && this->payload <= 126) ? this->payload : '?');
                         requestFocus();
-                        if (this->cursor == this->freetext.length()) {
-                            this->freetext += (char)this->payload;
+                        
+                        String charToAdd;
+                        if (this->payload == 209) {  // Ñ
+                            charToAdd = "Ñ";
+                        } else if (this->payload == 241) {  // ñ
+                            charToAdd = "ñ";
                         } else {
-                            this->freetext = this->freetext.substring(0, this->cursor) + (char)this->payload +
+                            charToAdd = (char)this->payload;
+                        }
+                        
+                        if (this->cursor == this->freetext.length()) {
+                            this->freetext += charToAdd;
+                        } else {
+                            this->freetext = this->freetext.substring(0, this->cursor) + charToAdd +
                                              this->freetext.substring(this->cursor);
                         }
-                        this->cursor++;
+                        // Increment cursor by the byte length of the added character (UTF-8 aware)
+                        this->cursor += charToAdd.length();
                         uint16_t maxChars =
                             meshtastic_Constants_DATA_PAYLOAD_LEN - (moduleConfig.canned_message.send_bell ? 1 : 0);
                         if (this->freetext.length() > maxChars) {
                             this->cursor = maxChars;
                             this->freetext = this->freetext.substring(0, maxChars);
                         }
+                        // Force display update to show Spanish characters immediately
+                        screen->forceDisplay();
                     }
                     break;
                 }
@@ -2445,12 +2498,31 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
                             currentLine.clear();
                             lineWidth = 0;
                         }
-                        // If word itself too big, split by character
+                        // If word itself too big, split by character (UTF-8 aware)
                         if (wordWidth > maxWidth) {
                             uint16_t charPos = 0;
                             while (charPos < word.length()) {
-                                String oneChar = word.substring(charPos, charPos + 1);
-                                int charWidth = display->getStringWidth(oneChar);
+                                // Detect UTF-8 character length
+                                int charLen = 1;
+                                unsigned char firstByte = (unsigned char)word[charPos];
+                                if ((firstByte & 0x80) == 0) {
+                                    charLen = 1; // ASCII
+                                } else if ((firstByte & 0xE0) == 0xC0) {
+                                    charLen = 2; // 2-byte UTF-8
+                                } else if ((firstByte & 0xF0) == 0xE0) {
+                                    charLen = 3; // 3-byte UTF-8
+                                } else if ((firstByte & 0xF8) == 0xF0) {
+                                    charLen = 4; // 4-byte UTF-8
+                                }
+                                
+                                // Safety check: don't read beyond string bounds
+                                if (charPos + charLen > word.length()) {
+                                    charLen = word.length() - charPos;
+                                }
+                                
+                                // Extract the full UTF-8 character
+                                String oneChar = word.substring(charPos, charPos + charLen);
+                                int charWidth = display->getStringWidth(oneChar.c_str());
                                 if (lineWidth + charWidth > maxWidth && lineWidth > 0) {
                                     lines.push_back(currentLine);
                                     currentLine.clear();
@@ -2458,7 +2530,7 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
                                 }
                                 currentLine.push_back({false, oneChar});
                                 lineWidth += charWidth;
-                                charPos++;
+                                charPos += charLen;
                             }
                         } else {
                             currentLine.push_back({false, word});
@@ -2471,13 +2543,79 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
             if (!currentLine.empty())
                 lines.push_back(currentLine);
 
-            // Draw lines with emotes
+            // Draw lines with emotes (with scroll support)
             int rowHeight = FONT_HEIGHT_SMALL;
             int yLine = inputY;
+            int totalLines = lines.size();
+            
+            // Calculate visible area and apply scroll bounds
+            int availableHeight = display->getHeight() - inputY;
+            int maxVisibleLines = availableHeight / rowHeight;
+            int maxScrollOffset = std::max(0, totalLines - maxVisibleLines);
+            
+            // ===== AUTO-SCROLL: Calculate which line contains the cursor =====
+            int cursorLine = 0;
+            int charCount = 0;
+            for (int lineIdx = 0; lineIdx < totalLines; lineIdx++) {
+                int lineCharCount = 0;
+                for (const auto &token : lines[lineIdx]) {
+                    if (!token.first) { // Only count text tokens, not emotes
+                        lineCharCount += token.second.length();
+                    }
+                }
+                if (charCount + lineCharCount >= this->cursor) {
+                    cursorLine = lineIdx;
+                    break;
+                }
+                charCount += lineCharCount;
+            }
+            
+            // Auto-scroll to keep cursor visible
+            if (cursorLine < freetextScrollOffset) {
+                // Cursor is above visible area - scroll up
+                freetextScrollOffset = cursorLine;
+            } else if (cursorLine >= freetextScrollOffset + maxVisibleLines) {
+                // Cursor is below visible area - scroll down
+                freetextScrollOffset = cursorLine - maxVisibleLines + 1;
+            }
+            
+            // Clamp scroll offset to valid range (after auto-scroll adjustment)
+            if (freetextScrollOffset > maxScrollOffset) {
+                freetextScrollOffset = maxScrollOffset;
+            }
+            if (freetextScrollOffset < 0) {
+                freetextScrollOffset = 0;
+            }
+            
+            // Render only visible lines (apply scroll offset)
+            int lineIndex = 0;
             for (auto &line : lines) {
+                // Skip lines that are scrolled out of view (above)
+                if (lineIndex < freetextScrollOffset) {
+                    lineIndex++;
+                    continue;
+                }
+                
+                // Stop rendering if we've filled the visible area
+                if (yLine >= inputY + availableHeight) {
+                    break;
+                }
+                
                 int nextX = x;
-                for (const auto &token : line) {
+                String accumulatedText = ""; // Accumulate consecutive text tokens
+                
+                for (size_t tokenIdx = 0; tokenIdx < line.size(); tokenIdx++) {
+                    const auto &token = line[tokenIdx];
+                    
                     if (token.first) {
+                        // Before drawing an emote, flush any accumulated text
+                        if (accumulatedText.length() > 0) {
+                            display->drawString(nextX, yLine, accumulatedText);
+                            nextX += display->getStringWidth(accumulatedText.c_str());
+                            accumulatedText = "";
+                        }
+                        
+                        // Draw emote
                         const graphics::Emote *emote = nullptr;
                         for (int j = 0; j < graphics::numEmotes; j++) {
                             if (token.second == graphics::emotes[j].label) {
@@ -2491,11 +2629,18 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
                             nextX += emote->width + 2;
                         }
                     } else {
-                        display->drawString(nextX, yLine, token.second);
-                        nextX += display->getStringWidth(token.second);
+                        // Accumulate text tokens
+                        accumulatedText += token.second;
                     }
                 }
+                
+                // Flush any remaining accumulated text at end of line
+                if (accumulatedText.length() > 0) {
+                    display->drawString(nextX, yLine, accumulatedText);
+                }
+                
                 yLine += rowHeight;
+                lineIndex++;
             }
         }
 #endif
@@ -3217,6 +3362,33 @@ bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
             }
 #endif
             return 1;
+        }
+
+        // Quick handlers: fn+e to launch emote carousel for current conversation,
+        // or ANY printable key to open free-text input (selecting the destination).
+        if (event->inputEvent == INPUT_BROKER_ANYKEY) {
+            // fn+e opens emoji carousel for current conversation
+            if (event->kbchar == INPUT_BROKER_MSG_EMOTE_LIST) {
+                if (messageCarouselIsChannel) {
+                    LaunchEmoteWithDestination(NODENUM_BROADCAST, messageCarouselChannel);
+                } else {
+                    LaunchEmoteWithDestination(messageCarouselNodeId, 0);
+                }
+                return 1;
+            }
+
+            // Any other key (e.g., a letter) should open the freetext flow selecting
+            // the current conversation as destination (mirrors "New Freetext Msg").
+            // Only trigger if it's a printable character (avoid control keys)
+            char k = (char)event->kbchar;
+            if (k >= 32 && k <= 126) {
+                if (messageCarouselIsChannel) {
+                    LaunchFreetextWithDestination(NODENUM_BROADCAST, messageCarouselChannel);
+                } else {
+                    LaunchFreetextWithDestination(messageCarouselNodeId, 0);
+                }
+                return 1;
+            }
         }
 
         return 0;
