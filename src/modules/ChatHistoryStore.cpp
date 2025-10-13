@@ -132,6 +132,8 @@ void ChatHistoryStore::addCHAN(uint8_t channel, uint32_t fromNode, bool outgoing
 void ChatHistoryStore::saveDM(uint32_t peer)
 {
     std::string filename = "/prefs/chat_dm_" + std::to_string(peer) + ".csv";
+    // Remove the file first to ensure truncation
+    FSCom.remove(filename.c_str());
     auto f = FSCom.open(filename.c_str(), FILE_O_WRITE);
     if (!f)
         return;
@@ -143,6 +145,11 @@ void ChatHistoryStore::saveDM(uint32_t peer)
 
 void ChatHistoryStore::loadDM(uint32_t peer)
 {
+    // Protection: Don't reload if already loaded
+    if (dm_.find(peer) != dm_.end() && !dm_[peer].empty()) {
+        return;
+    }
+    
     std::string filename = "/prefs/chat_dm_" + std::to_string(peer) + ".csv";
     auto f = FSCom.open(filename.c_str(), FILE_O_READ);
     if (!f)
@@ -178,6 +185,8 @@ void ChatHistoryStore::loadDM(uint32_t peer)
 void ChatHistoryStore::saveCHAN(uint8_t channel)
 {
     std::string filename = "/prefs/chat_ch_" + std::to_string(channel) + ".csv";
+    // Remove the file first to ensure truncation
+    FSCom.remove(filename.c_str());
     auto f = FSCom.open(filename.c_str(), FILE_O_WRITE);
     if (!f)
         return;
@@ -189,6 +198,11 @@ void ChatHistoryStore::saveCHAN(uint8_t channel)
 
 void ChatHistoryStore::loadCHAN(uint8_t channel)
 {
+    // Protection: Don't reload if already loaded
+    if (ch_.find(channel) != ch_.end() && !ch_[channel].empty()) {
+        return;
+    }
+    
     std::string filename = "/prefs/chat_ch_" + std::to_string(channel) + ".csv";
     auto f = FSCom.open(filename.c_str(), FILE_O_READ);
     if (!f)
