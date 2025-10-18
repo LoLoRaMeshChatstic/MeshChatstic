@@ -1,5 +1,5 @@
 #include "configuration.h"
-#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
+#if !defined(MESHTASTIC_EXCLUDE_SCREEN) && !defined(MESHTASTIC_EXCLUDE_BASEUI) && HAS_SCREEN
 #include "ClockRenderer.h"
 #include "FSCommon.h"
 #include "GPS.h"

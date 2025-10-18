@@ -93,7 +93,11 @@ class ChatHistoryStore
     void saveCHAN(uint8_t channel);
     void loadCHAN(uint8_t channel);
 
-    static constexpr size_t kMaxPerGroup = 50; // Max messages per conversation
+#ifdef ARCH_NRF52
+    static constexpr size_t kMaxPerGroup = 5; // Max messages per conversation (nRF52: limited flash)
+#else
+    static constexpr size_t kMaxPerGroup = 50; // Max messages per conversation (ESP32/other)
+#endif
     bool countersInitialized = false;
 
     std::map<uint32_t, std::deque<ChatEntry>> dm_; // DM conversations

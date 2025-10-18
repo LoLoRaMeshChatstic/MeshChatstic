@@ -33,6 +33,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "pcf8563.h"
 #endif
 
+/* Offer chance for variant-specific defines */
+#include "variant.h"
+
 // -----------------------------------------------------------------------------
 // Version
 // -----------------------------------------------------------------------------
@@ -121,6 +124,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Power Amps are often non-linear, so we can use an array of values for the power curve
 #define NUM_PA_POINTS 22
 #define TX_GAIN_LORA 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 10, 10, 9, 9, 8, 7
+#endif
+
+#ifdef STATION_G2
+#define NUM_PA_POINTS 19
+#define TX_GAIN_LORA 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 18, 18
 #endif
 
 // Default system gain to 0 if not defined
@@ -259,9 +267,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // convert 24-bit color to 16-bit (56K)
 #define COLOR565(r, g, b) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b & 0xF8) >> 3))
-
-/* Step #1: offer chance for variant-specific defines */
-#include "variant.h"
 
 #if defined(VEXT_ENABLE) && !defined(VEXT_ON_VALUE)
 // Older variant.h files might not be defining this value, so stay with the old default
@@ -452,7 +457,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Chat history modes for memory-constrained devices
 // CHAT_MEMORY_ONLY: Keep limited history in RAM only (no persistence)
 // MESHTASTIC_EXCLUDE_CHAT_HISTORY: Only last message per conversation
-#if defined(ARCH_NRF52) || defined(ARCH_RP2040)
+#if defined(ARCH_NRF52)
+// nRF52 with screen: Full persistence (MODE 1) - has enough flash (~230KB free)
+// nRF52 without screen: Memory-only mode to save RAM
+#if !HAS_SCREEN
+#define CHAT_MEMORY_ONLY 1
+#endif
+// If HAS_SCREEN, don't define CHAT_MEMORY_ONLY → Uses MODE 1 (full persistence)
+#elif defined(ARCH_RP2040)
 #define CHAT_MEMORY_ONLY 1
 // Enable limited chat history (30 messages) in RAM without persistence
 // This gives carousel functionality while saving Flash space

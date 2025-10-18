@@ -102,9 +102,6 @@ void ChatHistoryStore::pushBounded(std::deque<ChatEntry> &q, ChatEntry e)
 
 void ChatHistoryStore::addDM(uint32_t peer, bool outgoing, const std::string &text, uint32_t ts, bool unread)
 {
-    // Ensure historical data is loaded before adding new message
-    loadDM(peer);
-    
     ChatEntry e;
     e.ts = ts;
     e.outgoing = outgoing;
@@ -114,15 +111,12 @@ void ChatHistoryStore::addDM(uint32_t peer, bool outgoing, const std::string &te
     e.channel = 0;
     e.text = text;
     pushBounded(dm_[peer], std::move(e));
-    saveDM(peer);
+    saveDM(peer); // Save immediately to prevent data loss
 }
 
 void ChatHistoryStore::addCHAN(uint8_t channel, uint32_t fromNode, bool outgoing, const std::string &text, uint32_t ts,
                                bool unread)
 {
-    // Ensure historical data is loaded before adding new message
-    loadCHAN(channel);
-    
     ChatEntry e;
     e.ts = ts;
     e.outgoing = outgoing;
@@ -132,13 +126,12 @@ void ChatHistoryStore::addCHAN(uint8_t channel, uint32_t fromNode, bool outgoing
     e.channel = channel;
     e.text = text;
     pushBounded(ch_[channel], std::move(e));
-    saveCHAN(channel);
+    saveCHAN(channel); // Save immediately to prevent data loss
 }
 // --- Persistence ---
 void ChatHistoryStore::saveDM(uint32_t peer)
 {
-    std::string filename = "/chat_dm_" + std::to_string(peer) + ".txt";
-    FSCom.remove(filename.c_str());
+    std::string filename = "/prefs/chat_dm_" + std::to_string(peer) + ".txt";
     auto f = FSCom.open(filename.c_str(), FILE_O_WRITE);
     if (!f)
         return;
@@ -150,12 +143,7 @@ void ChatHistoryStore::saveDM(uint32_t peer)
 
 void ChatHistoryStore::loadDM(uint32_t peer)
 {
-    // Protection: Don't reload if already loaded
-    if (dm_.find(peer) != dm_.end() && !dm_[peer].empty()) {
-        return;
-    }
-    
-    std::string filename = "/chat_dm_" + std::to_string(peer) + ".txt";
+    std::string filename = "/prefs/chat_dm_" + std::to_string(peer) + ".txt";
     auto f = FSCom.open(filename.c_str(), FILE_O_READ);
     if (!f)
         return; // Archivo no existe, sin error
@@ -174,9 +162,6 @@ void ChatHistoryStore::loadDM(uint32_t peer)
                 }
             }
         }
-        // Apply kMaxPerGroup limit after loading from file
-        while (q.size() > kMaxPerGroup)
-            q.pop_front();
         dm_[peer] = std::move(q);
 #if defined(__EXCEPTIONS) || defined(ARCH_ESP32)
     } catch (...) {
@@ -189,8 +174,7 @@ void ChatHistoryStore::loadDM(uint32_t peer)
 
 void ChatHistoryStore::saveCHAN(uint8_t channel)
 {
-    std::string filename = "/chat_ch_" + std::to_string(channel) + ".txt";
-    FSCom.remove(filename.c_str());
+    std::string filename = "/prefs/chat_ch_" + std::to_string(channel) + ".txt";
     auto f = FSCom.open(filename.c_str(), FILE_O_WRITE);
     if (!f)
         return;
@@ -202,12 +186,7 @@ void ChatHistoryStore::saveCHAN(uint8_t channel)
 
 void ChatHistoryStore::loadCHAN(uint8_t channel)
 {
-    // Protection: Don't reload if already loaded
-    if (ch_.find(channel) != ch_.end() && !ch_[channel].empty()) {
-        return;
-    }
-    
-    std::string filename = "/chat_ch_" + std::to_string(channel) + ".txt";
+    std::string filename = "/prefs/chat_ch_" + std::to_string(channel) + ".txt";
     auto f = FSCom.open(filename.c_str(), FILE_O_READ);
     if (!f)
         return; // Archivo no existe, sin error
@@ -226,9 +205,6 @@ void ChatHistoryStore::loadCHAN(uint8_t channel)
                 }
             }
         }
-        // Apply kMaxPerGroup limit after loading from file
-        while (q.size() > kMaxPerGroup)
-            q.pop_front();
         ch_[channel] = std::move(q);
 #if defined(__EXCEPTIONS) || defined(ARCH_ESP32)
     } catch (...) {
@@ -241,6 +217,7 @@ void ChatHistoryStore::loadCHAN(uint8_t channel)
 
 void ChatHistoryStore::saveAll()
 {
+    // Save everything
     for (const auto &kv : dm_)
         saveDM(kv.first);
     for (const auto &kv : ch_)
@@ -338,7 +315,7 @@ void ChatHistoryStore::clearChatHistoryDM(uint32_t peer)
     dm_.erase(peer);
 
     // Eliminar archivo persistente (mismo formato que save/load)
-    std::string filename = "/chat_dm_" + std::to_string(peer) + ".txt";
+    std::string filename = "/prefs/chat_dm_" + std::to_string(peer) + ".txt";
     FSCom.remove(filename.c_str());
 }
 
@@ -348,7 +325,7 @@ void ChatHistoryStore::clearChatHistoryChannel(uint8_t channel)
     ch_.erase(channel);
 
     // Eliminar archivo persistente (mismo formato que save/load)
-    std::string filename = "/chat_ch_" + std::to_string(channel) + ".txt";
+    std::string filename = "/prefs/chat_ch_" + std::to_string(channel) + ".txt";
     FSCom.remove(filename.c_str());
 }
 

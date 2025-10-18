@@ -28,6 +28,10 @@
 #include <pb_encode.h>
 #include <vector>
 
+#if defined(ARDUINO_ARCH_ESP32)
+#include "esp_task_wdt.h"
+#endif
+
 #ifdef ARCH_ESP32
 #if HAS_WIFI
 #include "mesh/wifi/WiFiAPClient.h"
@@ -389,6 +393,14 @@ NodeDB::NodeDB()
     }
 #endif
 
+#ifdef FORCE_DISPLAY_MODE
+    // Force displaymode to specific value (overrides saved config)
+    if (config.display.displaymode != FORCE_DISPLAY_MODE) {
+        LOG_INFO("Forcing displaymode to %d (was %d)", FORCE_DISPLAY_MODE, config.display.displaymode);
+        config.display.displaymode = FORCE_DISPLAY_MODE;
+    }
+#endif
+
     if (devicestateCRC != crc32Buffer(&devicestate, sizeof(devicestate)))
         saveWhat |= SEGMENT_DEVICESTATE;
     if (nodeDatabaseCRC != crc32Buffer(&nodeDatabase, sizeof(nodeDatabase)))
@@ -664,7 +676,7 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     config.bluetooth.fixed_pin = defaultBLEPin;
 
 #if defined(ST7735_CS) || defined(USE_EINK) || defined(ILI9341_DRIVER) || defined(ILI9342_DRIVER) || defined(ST7789_CS) ||       \
-    defined(HX8357_CS) || defined(USE_ST7789) || defined(ILI9488_CS) || defined(ST7796_CS) || defined(USE_SPISSD1306)
+    defined(HX8357_CS) || defined(USE_ST7789) || defined(ILI9488_CS) || defined(ST7796_CS) || defined(USE_SPISSD1306) || defined(USE_ILI9225)
     bool hasScreen = true;
 #ifdef HELTEC_MESH_NODE_T114
     uint32_t st7789_id = get_st7789_id(ST7789_NSS, ST7789_SCK, ST7789_SDA, ST7789_RS, ST7789_RESET);
@@ -1307,7 +1319,7 @@ void NodeDB::loadFromDisk()
     state = loadProto(channelFileName, meshtastic_ChannelFile_size, sizeof(meshtastic_ChannelFile), &meshtastic_ChannelFile_msg,
                       &channelFile);
     if (state != LoadFileResult::LOAD_SUCCESS) {
-        installDefaultChannels(); // Our in RAM copy might now be corrupt
+            installDefaultChannels(); // Our in RAM copy might now be corrupt
     } else {
         if (channelFile.version < DEVICESTATE_MIN_VER) {
             LOG_WARN("channelFile %d is old, discard", channelFile.version);
@@ -1357,6 +1369,10 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
 {
     bool okay = false;
 #ifdef FSCom
+#if defined(ARDUINO_ARCH_ESP32)
+    // Reset watchdog before filesystem operations
+    esp_task_wdt_reset();
+#endif
     auto f = SafeFile(filename, fullAtomic);
 
     LOG_INFO("Save %s", filename);
@@ -1368,6 +1384,10 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
         okay = true;
     }
 
+#if defined(ARDUINO_ARCH_ESP32)
+    // Reset watchdog after encoding
+    esp_task_wdt_reset();
+#endif
     bool writeSucceeded = f.close();
 
     if (!okay || !writeSucceeded) {

@@ -22,7 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "configuration.h"
-#if HAS_SCREEN
+#if HAS_SCREEN && !defined(MESHTASTIC_EXCLUDE_BASEUI)
 #include "MessageRenderer.h"
 
 // Core includes

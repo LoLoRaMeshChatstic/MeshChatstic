@@ -1,5 +1,5 @@
 #include "configuration.h"
-#if HAS_SCREEN
+#if HAS_SCREEN && !defined(MESHTASTIC_EXCLUDE_BASEUI)
 #include "CompassRenderer.h"
 #include "GPSStatus.h"
 #include "NodeDB.h"
@@ -908,8 +908,7 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
         int chutil_percent = airTime->channelUtilizationPercent();
 
         int centerofscreen = SCREEN_WIDTH / 2;
-        int total_line_content_width =
-            (chUtil_x + chutil_bar_width + display->getStringWidth(chUtilPercentage) + extraoffset) / 2;
+    int total_line_content_width = (chUtil_x + chutil_bar_width + display->getStringWidth(chUtilPercentage) + extraoffset) / 2;
         int starting_position = centerofscreen - total_line_content_width;
         if (!config.bluetooth.enabled) {
             starting_position = 0;

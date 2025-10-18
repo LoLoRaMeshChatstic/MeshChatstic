@@ -1,5 +1,5 @@
 #include "configuration.h"
-#if HAS_SCREEN
+#if HAS_SCREEN && !defined(MESHTASTIC_EXCLUDE_BASEUI)
 #include "ClockRenderer.h"
 #include "NodeDB.h"
 #include "UIRenderer.h"

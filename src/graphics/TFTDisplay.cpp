@@ -111,6 +111,98 @@ class LGFX : public lgfx::LGFX_Device
 
 static LGFX *tft = nullptr;
 
+#elif defined(USE_ILI9225)
+#include <LovyanGFX.hpp> // Graphics and font library for ILI9225 driver chip
+
+#ifndef TFT_INVERT
+#define TFT_INVERT false
+#endif
+
+class LGFX : public lgfx::LGFX_Device
+{
+    lgfx::Panel_ILI9225 _panel_instance;
+    lgfx::Bus_SPI _bus_instance;
+    lgfx::Light_PWM _light_instance;
+
+  public:
+    LGFX(void)
+    {
+        {
+            auto cfg = _bus_instance.config();
+
+            // configure SPI
+            cfg.spi_host = ILI9225_SPI_HOST; // ESP32-S2,S3,C3 : SPI2_HOST or SPI3_HOST / ESP32 : VSPI_HOST or HSPI_HOST
+            cfg.spi_mode = 0;
+            cfg.freq_write = SPI_FREQUENCY;     // SPI clock for transmission (up to 40MHz for ILI9225)
+            cfg.freq_read = SPI_READ_FREQUENCY; // SPI clock when receiving
+            cfg.spi_3wire = false;              // Set to true if reception is done on the MOSI pin
+            cfg.use_lock = true;                // Set to true to use transaction locking (critical for stability)
+            cfg.dma_channel = SPI_DMA_CH_AUTO;  // Set DMA channel to use (auto-select safe channel)
+            cfg.pin_sclk = ILI9225_SCK;         // Set SPI SCLK pin number
+            cfg.pin_mosi = ILI9225_MOSI;        // Set SPI MOSI pin number
+            cfg.pin_miso = ILI9225_MISO;        // Set SPI MISO pin number (-1 = disable)
+            cfg.pin_dc = ILI9225_DC;            // Set SPI DC pin number (-1 = disable)
+
+            _bus_instance.config(cfg);              // applies the set value to the bus.
+            _panel_instance.setBus(&_bus_instance); // set the bus on the panel.
+        }
+
+        {                                        // Set the display panel control.
+            auto cfg = _panel_instance.config(); // Gets a structure for display panel settings.
+
+            cfg.pin_cs = ILI9225_CS;   // Pin number where CS is connected (-1 = disable)
+            cfg.pin_rst = ILI9225_RST; // Pin number where RST is connected  (-1 = disable)
+            cfg.pin_busy = -1;         // Pin number where BUSY is connected (-1 = disable)
+
+            // Display settings for ILI9225 (176x220 pixels)
+            cfg.panel_width = TFT_WIDTH;   // actual displayable width (176)
+            cfg.panel_height = TFT_HEIGHT; // actual displayable height (220)
+            cfg.offset_x = TFT_OFFSET_X;   // Panel offset amount in X direction
+            cfg.offset_y = TFT_OFFSET_Y;   // Panel offset amount in Y direction
+#ifdef TFT_OFFSET_ROTATION
+            cfg.offset_rotation = TFT_OFFSET_ROTATION; // Rotation 0~7 (configured in platformio.ini)
+#else
+            cfg.offset_rotation = 0;       // Default: no rotation
+#endif
+            cfg.dummy_read_pixel = 8;      // Number of bits for dummy read before pixel readout
+            cfg.dummy_read_bits = 1;       // Number of bits for dummy read before non-pixel data read
+            cfg.readable = true;           // Set to true if data can be read
+            cfg.invert = TFT_INVERT;       // Set to true if the light/darkness of the panel is reversed
+            cfg.rgb_order = TFT_RGB_ORDER; // Set to true if the panel's red and blue are swapped
+            cfg.dlen_16bit = false;        // Set to true for panels that transmit data length in 16-bit units
+#ifdef ILI9225_BUS_SHARED
+            cfg.bus_shared = ILI9225_BUS_SHARED; // Configurable: shared or separate SPI bus
+#else
+            cfg.bus_shared = false;        // Default: separate SPI bus (safer for LoRa compatibility)
+#endif
+
+            // ILI9225 specific settings
+            cfg.memory_width = TFT_WIDTH;   // Maximum width supported by the driver IC (176)
+            cfg.memory_height = TFT_HEIGHT; // Maximum height supported by the driver IC (220)
+            _panel_instance.config(cfg);
+        }
+
+#ifdef ILI9225_BL
+        // Set the backlight control
+        {
+            auto cfg = _light_instance.config(); // Gets a structure for backlight settings.
+
+            cfg.pin_bl = ILI9225_BL; // Pin number to which the backlight is connected
+            cfg.invert = false;      // Set according to your backlight circuit (false for active HIGH)
+            cfg.freq = 44100;        // PWM frequency of backlight
+            cfg.pwm_channel = 7;     // PWM channel number to use (0-15)
+
+            _light_instance.config(cfg);
+            _panel_instance.setLight(&_light_instance); // Set the backlight on the panel.
+        }
+#endif
+
+        setPanel(&_panel_instance);
+    }
+};
+
+static LGFX *tft = nullptr;
+
 #elif defined(RAK14014)
 #include <RAK14014_FT6336U.h>
 #include <TFT_eSPI.h>
@@ -1195,7 +1287,7 @@ public:
 
 #if defined(ST7701_CS) || defined(ST7735_CS) || defined(ST7789_CS) || defined(ST7796_CS) || defined(ILI9341_DRIVER) ||           \
     defined(ILI9342_DRIVER) || defined(RAK14014) || defined(HX8357_CS) || defined(ILI9488_CS) || defined(ST72xx_DE) ||           \
-    defined(USE_ST7920) || (ARCH_PORTDUINO && HAS_SCREEN != 0)
+    defined(USE_ST7920) || defined(USE_ILI9225) || (ARCH_PORTDUINO && HAS_SCREEN != 0)
 #include "SPILock.h"
 #include "TFTDisplay.h"
 #include <SPI.h>
@@ -1211,8 +1303,17 @@ TFTDisplay::TFTDisplay(uint8_t address, int sda, int scl, OLEDDISPLAY_GEOMETRY g
 {
     LOG_DEBUG("TFTDisplay!");
 
-#ifdef TFT_BL
+#if defined(TFT_BL)
     GpioPin *p = new GpioHwPin(TFT_BL);
+
+    if (!TFT_BACKLIGHT_ON) { // Need to invert the pin before hardware
+        auto virtPin = new GpioVirtPin();
+        new GpioNotTransformer(
+            virtPin, p); // We just leave this created object on the heap so it can stay watching virtPin and driving en_gpio
+        p = virtPin;
+    }
+#elif defined(ILI9225_BL)
+    GpioPin *p = new GpioHwPin(ILI9225_BL);
 
     if (!TFT_BACKLIGHT_ON) { // Need to invert the pin before hardware
         auto virtPin = new GpioVirtPin();
@@ -1532,22 +1633,36 @@ bool TFTDisplay::connect()
     }
     return false;
 #else
+    // Use SPI lock to prevent conflicts with LoRa module during initialization
     concurrency::LockGuard g(spiLock);
     LOG_INFO("Do TFT init");
+#ifdef USE_ILI9225
+    LOG_INFO("ILI9225 SPI_HOST value: %d (SPI2_HOST=1, SPI3_HOST=2)", ILI9225_SPI_HOST);
+    LOG_INFO("ILI9225 pins - SCK:%d MOSI:%d MISO:%d CS:%d DC:%d RST:%d", 
+             ILI9225_SCK, ILI9225_MOSI, ILI9225_MISO, ILI9225_CS, ILI9225_DC, ILI9225_RST);
+    // Small delay to ensure pins are stable before init
+    delay(50);
+#endif
 #ifdef RAK14014
     tft = new TFT_eSPI;
 #else
     tft = new LGFX;
 #endif
 
-    backlightEnable->set(true);
-    LOG_INFO("Power to TFT Backlight");
+    if (backlightEnable) {
+        backlightEnable->set(true);
+        LOG_INFO("Power to TFT Backlight");
+    } else {
+        LOG_WARN("backlightEnable is NULL, skipping backlight control");
+    }
 
 #ifdef UNPHONE
     unphone.backlight(true); // using unPhone library
 #endif
 
+    LOG_INFO("Initializing TFT display...");
     tft->init();
+    LOG_INFO("TFT init completed successfully");
 
 #if defined(M5STACK)
     tft->setRotation(0);
@@ -1562,6 +1677,9 @@ bool TFTDisplay::connect()
     tft->setRotation(1); // T-Deck has the TFT in landscape
 #elif defined(T_WATCH_S3)
     tft->setRotation(2); // T-Watch S3 left-handed orientation
+#elif defined(USE_ILI9225)
+    // Rotation already configured via cfg.offset_rotation in constructor
+    tft->setBrightness(255); // Set backlight to maximum
 #elif ARCH_PORTDUINO || defined(SENSECAP_INDICATOR) || defined(T_LORA_PAGER)
     tft->setRotation(0); // use config.yaml to set rotation
 #else

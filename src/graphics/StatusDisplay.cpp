@@ -119,73 +119,57 @@ void StatusDisplay::updateDisplay()
     if (!display) return;
 
     display->clear();
+    display->setFont(ArialMT_Plain_10); // Fuente pequeña y legible
 
-    // Line 0: Battery status (compact)
+    // Line 0: Battery status
     String batteryLine = "";
     if (status.hasUSB) {
-        batteryLine = "PWR:USB";
+        batteryLine = "Pwr: USB";
         if (status.batteryPercent > 0) {
             batteryLine += " " + String((int)status.batteryPercent) + "%";
         }
     } else if (status.batteryPercent > 0) {
-        batteryLine = "BAT:" + String((int)status.batteryPercent) + "%";
+        batteryLine = "Bat: " + String((int)status.batteryPercent) + "%";
         if (status.isCharging) {
             batteryLine += " CHG";
         }
     } else {
-        batteryLine = "BAT:Unknown";
+        batteryLine = "Bat: N/A";
     }
     drawStatusLine(0, batteryLine);
 
-    // Line 1: GPS Status (compact)
-    String gpsLine = "";
-    if (status.hasGPSLock) {
-        gpsLine = "GPS:OK " + String(status.numSatellites) + " sats";
-    } else if (status.numSatellites > 0) {
-        gpsLine = "GPS:FIX " + String(status.numSatellites) + " sats";
-    } else {
-        gpsLine = "GPS:NO SIGNAL";
-    }
-    drawStatusLine(1, gpsLine);
-
-    // Line 2: Node status (compact)
-    String nodeeLine = "";
+    // Line 1: Node status
+    String nodeLine = "";
     if (status.totalNodes > 0) {
-        nodeeLine = "MESH:" + String(status.onlineNodes) + "/" + String(status.totalNodes) + " nodes";
+        nodeLine = "Mesh: " + String(status.onlineNodes) + "/" + String(status.totalNodes);
     } else {
-        nodeeLine = "MESH:No nodes";
+        nodeLine = "Mesh: 0 nodes";
     }
-    drawStatusLine(2, nodeeLine);
+    drawStatusLine(1, nodeLine);
 
-    // Line 3: Connectivity (compact)
-    String connLine = "";
-    connLine += status.wifiConnected ? "WiFi:Y " : "WiFi:N ";
-    connLine += status.mqttConnected ? "MQTT:Y" : "MQTT:N";
-    drawStatusLine(3, connLine);
+    // Line 2: WiFi Status (línea independiente)
+    String wifiLine = status.wifiConnected ? "WiFi: Connected" : "WiFi: Disconnected";
+    drawStatusLine(2, wifiLine);
 
-    // Line 4: Messages (compact)
+    // Line 3: MQTT Status (línea independiente)
+    String mqttLine = status.mqttConnected ? "MQTT: Connected" : "MQTT: Disconnected";
+    drawStatusLine(3, mqttLine);
+
+    // Line 4: Messages
     String msgLine = "";
     if (status.unreadMessages > 0) {
-        msgLine = "MSG:" + String(status.unreadMessages) + " unread";
+        msgLine = "Msgs: " + String(status.unreadMessages) + " new";
     } else {
-        msgLine = "MSG:All read";
+        msgLine = "Msgs: None";
     }
     drawStatusLine(4, msgLine);
 
-    // Line 5: Uptime (compact)
+    // Line 5: Uptime
     status.uptime = millis() / 1000;
     uint32_t hours = status.uptime / 3600;
     uint32_t minutes = (status.uptime % 3600) / 60;
-    String uptimeLine = "UP:" + String(hours) + "h" + String(minutes) + "m";
+    String uptimeLine = "Up: " + String(hours) + "h " + String(minutes) + "m";
     drawStatusLine(5, uptimeLine);
-
-    // Line 6: Memory info (compact)
-#ifdef ARCH_ESP32
-    String memLine = "RAM:" + String(ESP.getFreeHeap() / 1024) + "KB free";
-#else
-    String memLine = "RAM: N/A";
-#endif
-    drawStatusLine(6, memLine);
 
     display->display();
 }
@@ -194,7 +178,10 @@ void StatusDisplay::drawStatusLine(int line, const String& text)
 {
     if (!display) return;
     
-    int y = line * 9 + 9; // 9 pixels per line for compact display, +9 for baseline
+    // Fuente ArialMT_Plain_10 tiene altura de ~10 pixels
+    int lineHeight = 10;
+    int y = line * lineHeight + lineHeight; // +lineHeight para baseline
+    
     if (y > 64) return; // Don't draw beyond display height (64px)
     
     display->drawString(0, y, text);
